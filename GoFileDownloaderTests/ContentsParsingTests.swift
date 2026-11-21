@@ -113,8 +113,8 @@ struct ContentsParsingTests {
         )
 
         let finalURL = FileDownloader.destinationURL(baseDirectory: tempDir, file: remoteFile)
-        let partURL = FileDownloader.partURL(for: finalURL, fileID: remoteFile.id)
-        try FileManager.default.createDirectory(at: finalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let partURL = FileDownloader.partURL(for: remoteFile, in: tempDir)
+        try FileManager.default.createDirectory(at: partURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try partialPrefix.write(to: partURL)
 
         let capturedRangeHeader = OSAllocatedUnfairLock<String?>(initialState: nil)
@@ -161,7 +161,8 @@ struct ContentsParsingTests {
             expectedSize: Int64(fullData.count)
         )
         let finalURL = FileDownloader.destinationURL(baseDirectory: tempDir, file: remoteFile)
-        let partURL = FileDownloader.partURL(for: finalURL, fileID: remoteFile.id)
+        let partURL = FileDownloader.partURL(for: remoteFile, in: tempDir)
+        try FileManager.default.createDirectory(at: partURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("STALE!!".utf8).write(to: partURL)
 
         let callCount = OSAllocatedUnfairLock<Int>(initialState: 0)
@@ -207,7 +208,8 @@ struct ContentsParsingTests {
             expectedSize: Int64(fullData.count)
         )
         let completeFinal = FileDownloader.destinationURL(baseDirectory: tempDir, file: completeFile)
-        let completePart = FileDownloader.partURL(for: completeFinal, fileID: completeFile.id)
+        let completePart = FileDownloader.partURL(for: completeFile, in: tempDir)
+        try FileManager.default.createDirectory(at: completePart.deletingLastPathComponent(), withIntermediateDirectories: true)
         try fullData.write(to: completePart)
 
         let rescueRequests = OSAllocatedUnfairLock<Int>(initialState: 0)
@@ -238,8 +240,8 @@ struct ContentsParsingTests {
             relativeDirectory: [],
             expectedSize: nil
         )
-        let badFinal = FileDownloader.destinationURL(baseDirectory: tempDir, file: badFile)
-        let badPart = FileDownloader.partURL(for: badFinal, fileID: badFile.id)
+        let badPart = FileDownloader.partURL(for: badFile, in: tempDir)
+        try FileManager.default.createDirectory(at: badPart.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("stale".utf8).write(to: badPart)
 
         let loopRequests = OSAllocatedUnfairLock<Int>(initialState: 0)
@@ -619,5 +621,157 @@ struct ContentsParsingTests {
         #expect(out2 == .downloaded(totalBytes: Int64(partData.count), resumed: false))
         #expect(try Data(contentsOf: tempDir.appendingPathComponent("clip.mp4")) == videoData)
         #expect(try Data(contentsOf: tempDir.appendingPathComponent("clip.mp4.part")) == partData)
+        // Staging directory should be cleaned up once no active .part files remain
+        let stagingDir = tempDir.appendingPathComponent(GoFileConfig.partialStagingDirectoryName)
+        #expect(!FileManager.default.fileExists(atPath: stagingDir.path))
+    }
+
+    @Test("Reports pagination overflow and recursion depth overflow instead of returning partial manifests")
+    func reportsPaginationAndDepthOverflow() async throws {
+        // Pagination overflow: still reports hasNextPage == true after maxPaginationPages
+        let pageCount = OSAllocatedUnfairLock<Int>(initialState: 0)
+        MockURLProtocol.handler = { request in
+            let p = pageCount.withLock { c in c += 1; return c }
+            let json = """
+            {
+              "status": "ok",
+              "metadata": { "hasNextPage": true },
+              "data": {
+                "id": "huge",
+                "type": "folder",
+                "name": "HugeAlbum",
+                "children": {
+                  "f-\(p)": { "id": "f-\(p)", "type": "file", "name": "file\(p).txt", "link": "https://example.com/\(p)", "createTime": \(p) }
+                }
+              }
+            }
+            """
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data(json.utf8))
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let api = GoFileAPI(session: makeMockSession())
+        do {
+            _ = try await api.resolveFiles(contentID: "huge", plainPassword: nil, accountToken: "tok")
+            Issue.record("Expected pagination overflow error")
+        } catch let GoFileError.apiError(msg) {
+            #expect(msg.contains("pagination"))
+        }
+        #expect(pageCount.withLock { $0 } == GoFileConfig.maxPaginationPages)
+
+        // Recursion depth overflow: chain of folders deeper than maxFolderRecursionDepth
+        MockURLProtocol.handler = { request in
+            let currentID = request.url?.lastPathComponent ?? "d0"
+            let depthNum = Int(currentID.dropFirst()) ?? 0
+            let nextID = "d\(depthNum + 1)"
+            let json = """
+            {
+              "status": "ok",
+              "data": {
+                "id": "\(currentID)",
+                "type": "folder",
+                "name": "level\(depthNum)",
+                "children": {
+                  "\(nextID)": { "id": "\(nextID)", "type": "folder", "name": "level\(depthNum + 1)", "createTime": 1 }
+                }
+              }
+            }
+            """
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data(json.utf8))
+        }
+        do {
+            _ = try await api.resolveFiles(contentID: "d0", plainPassword: nil, accountToken: "tok")
+            Issue.record("Expected recursion depth overflow error")
+        } catch let GoFileError.apiError(msg) {
+            #expect(msg.contains("depth"))
+        }
+
+        // Root folder named .gofile-partial is renamed out of staging namespace
+        MockURLProtocol.handler = { request in
+            let json = """
+            {
+              "status": "ok",
+              "data": {
+                "id": "stg",
+                "type": "folder",
+                "name": "\(GoFileConfig.partialStagingDirectoryName)",
+                "children": {
+                  "f1": { "id": "f1", "type": "file", "name": "a.txt", "link": "https://example.com/a", "createTime": 1 }
+                }
+              }
+            }
+            """
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data(json.utf8))
+        }
+        let renamed = try await api.resolveFiles(contentID: "stg", plainPassword: nil, accountToken: "tok")
+        #expect(renamed.count == 1)
+        #expect(renamed[0].relativeDirectory.first != GoFileConfig.partialStagingDirectoryName)
+        #expect(renamed[0].relativeDirectory.first == "\(GoFileConfig.partialStagingDirectoryName) (1)")
+    }
+
+    @Test("Rejects existing directory at destination and restarts on Last-Modified mismatch")
+    func rejectsExistingDirectoryAndLastModifiedMismatch() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // Existing directory at finalURL must not be skipped
+        let dirConflictFile = RemoteFile(
+            id: "dir-conflict",
+            filename: "existingDir",
+            downloadLink: "https://example.com/existingDir",
+            relativeDirectory: [],
+            expectedSize: nil
+        )
+        try FileManager.default.createDirectory(
+            at: FileDownloader.destinationURL(baseDirectory: tempDir, file: dirConflictFile),
+            withIntermediateDirectories: true
+        )
+        let downloader = FileDownloader(session: makeMockSession())
+        await #expect(throws: GoFileError.unsafePath(dirConflictFile.relativePath)) {
+            _ = try await downloader.download(file: dirConflictFile, to: tempDir, accountToken: "tok") { _ in }
+        }
+
+        // Last-Modified mismatch on HTTP 206 restarts cleanly from byte 0
+        let freshData = Data("NEW-FILE-CONTENT".utf8)
+        let lmFile = RemoteFile(
+            id: "lm-mismatch",
+            filename: "report.bin",
+            downloadLink: "https://example.com/report.bin",
+            relativeDirectory: [],
+            expectedSize: Int64(freshData.count)
+        )
+        let lmPart = FileDownloader.partURL(for: lmFile, in: tempDir)
+        let lmMeta = FileDownloader.resumeMetaURL(for: lmPart)
+        try FileManager.default.createDirectory(at: lmPart.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("OLD-".utf8).write(to: lmPart)
+        try Data(#"{"etag":null,"lastModified":"Mon, 01 Jan 2024 00:00:00 GMT","expectedSize":16}"#.utf8).write(to: lmMeta)
+
+        let calls = OSAllocatedUnfairLock<Int>(initialState: 0)
+        MockURLProtocol.handler = { request in
+            let n = calls.withLock { c in c += 1; return c }
+            if n == 1 {
+                let headers = [
+                    "Content-Length": "\(freshData.count - 4)",
+                    "Content-Range": "bytes 4-\(freshData.count - 1)/\(freshData.count)",
+                    "Last-Modified": "Tue, 02 Jan 2024 00:00:00 GMT",
+                ]
+                return (HTTPURLResponse(url: request.url!, statusCode: 206, httpVersion: nil, headerFields: headers)!, Data(freshData.dropFirst(4)))
+            }
+            let headers = [
+                "Content-Length": "\(freshData.count)",
+                "Last-Modified": "Tue, 02 Jan 2024 00:00:00 GMT",
+            ]
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: headers)!, freshData)
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = try await downloader.download(file: lmFile, to: tempDir, accountToken: "tok") { _ in }
+        #expect(calls.withLock { $0 } == 2)
+        #expect(outcome == .downloaded(totalBytes: Int64(freshData.count), resumed: false))
+        #expect(try Data(contentsOf: FileDownloader.destinationURL(baseDirectory: tempDir, file: lmFile)) == freshData)
     }
 }

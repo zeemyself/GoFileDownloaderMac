@@ -297,15 +297,15 @@ public final class DownloadStore {
 
     public func revealItem(_ item: DownloadItem) {
         let fm = FileManager.default
-        let partURL = FileDownloader.partURL(for: item.destinationURL, fileID: item.id)
+        let baseDir = sessionBaseDirectory ?? downloadFolder
+        let partURL = FileDownloader.partURL(for: item.remoteFile, in: baseDir)
         if fm.fileExists(atPath: item.destinationURL.path) {
             NSWorkspace.shared.activateFileViewerSelecting([item.destinationURL])
         } else if fm.fileExists(atPath: partURL.path) {
             NSWorkspace.shared.activateFileViewerSelecting([partURL])
         } else {
             let folder = item.destinationURL.deletingLastPathComponent()
-            let fallback = sessionBaseDirectory ?? downloadFolder
-            NSWorkspace.shared.open(fm.fileExists(atPath: folder.path) ? folder : fallback)
+            NSWorkspace.shared.open(fm.fileExists(atPath: folder.path) ? folder : baseDir)
         }
     }
 
@@ -345,7 +345,8 @@ public final class DownloadStore {
 
         if forceRestart {
             let fm = FileManager.default
-            let partURL = FileDownloader.partURL(for: item.destinationURL, fileID: item.id)
+            let baseDir = sessionBaseDirectory ?? downloadFolder
+            let partURL = FileDownloader.partURL(for: item.remoteFile, in: baseDir)
             let metaURL = FileDownloader.resumeMetaURL(for: partURL)
             do {
                 if fm.fileExists(atPath: item.destinationURL.path) {
@@ -357,6 +358,7 @@ public final class DownloadStore {
                 if fm.fileExists(atPath: metaURL.path) {
                     try? fm.removeItem(at: metaURL)
                 }
+                FileDownloader.cleanupStagingDirectoryIfEmpty(in: baseDir)
             } catch {
                 let details = "Could not remove existing file for \(item.filename): \(error.localizedDescription)"
                 item.resetSpeed()

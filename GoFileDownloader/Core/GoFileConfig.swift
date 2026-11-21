@@ -15,6 +15,7 @@ public enum GoFileConfig {
     public static let maxPathComponentUTF8Bytes = 220
     public static let maxFolderRecursionDepth = 32
     public static let maxPaginationPages = 100
+    public static let partialStagingDirectoryName = ".gofile-partial"
 
     public static let kb = 1024
     public static let mb = 1024 * kb

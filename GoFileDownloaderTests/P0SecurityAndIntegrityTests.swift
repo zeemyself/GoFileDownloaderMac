@@ -39,6 +39,8 @@ struct P0SecurityAndIntegrityTests {
             RemoteFile(id: "4", filename: "a\\b.txt", downloadLink: "https://example.com/4", relativeDirectory: []),
             RemoteFile(id: "5", filename: "a\0b.txt", downloadLink: "https://example.com/5", relativeDirectory: []),
             RemoteFile(id: "6", filename: ".", downloadLink: "https://example.com/6", relativeDirectory: ["sub"]),
+            RemoteFile(id: "6b", filename: "staged.part", downloadLink: "https://example.com/6b", relativeDirectory: [GoFileConfig.partialStagingDirectoryName]),
+            RemoteFile(id: "6c", filename: GoFileConfig.partialStagingDirectoryName.uppercased(), downloadLink: "https://example.com/6c", relativeDirectory: []),
         ]
 
         for bad in traversalCases {
@@ -60,6 +62,24 @@ struct P0SecurityAndIntegrityTests {
             _ = try FileDownloader.validatedDestinationURL(baseDirectory: baseDir, file: symlinkEscapeFile)
         }
 
+        // Nested relative symlink escape: dirLink -> outsideDir/sub, relLink -> ../pwned.txt
+        // (Must not lexically collapse dirLink/.. back into baseDir!)
+        let outsideSub = outsideDir.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: outsideSub, withIntermediateDirectories: true)
+        let nestedDirLink = baseDir.appendingPathComponent("nestedLink", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: nestedDirLink, withDestinationURL: outsideSub)
+        let relativeEscapeLink = outsideSub.appendingPathComponent("relEscape.txt")
+        try FileManager.default.createSymbolicLink(atPath: relativeEscapeLink.path, withDestinationPath: "../pwned.txt")
+        let chainedSymlinkFile = RemoteFile(
+            id: "7b",
+            filename: "relEscape.txt",
+            downloadLink: "https://example.com/7b",
+            relativeDirectory: ["nestedLink"]
+        )
+        #expect(throws: GoFileError.unsafePath(chainedSymlinkFile.relativePath)) {
+            _ = try FileDownloader.validatedDestinationURL(baseDirectory: baseDir, file: chainedSymlinkFile)
+        }
+
         // Valid nested file succeeds even when parent does not yet exist
         let valid = RemoteFile(
             id: "8",
@@ -71,21 +91,31 @@ struct P0SecurityAndIntegrityTests {
         #expect(resolved.lastPathComponent == "safe.bin")
     }
 
-    @Test("partURL avoids .part filename collisions and respects 255-byte NAME_MAX")
+    @Test("partURL isolates temp files inside staging namespace and respects 255-byte NAME_MAX")
     func collisionSafePartURL() {
         let dir = URL(fileURLWithPath: "/tmp/gfd-part-test", isDirectory: true)
-        let normalFinal = dir.appendingPathComponent("clip.mp4")
-        let literalPartFinal = dir.appendingPathComponent("clip.mp4.part")
+        let normalFile = RemoteFile(id: "file-1", filename: "clip.mp4", downloadLink: "https://example.com/1", relativeDirectory: [])
+        let literalPartFile = RemoteFile(id: "file-2", filename: "clip.mp4.part", downloadLink: "https://example.com/2", relativeDirectory: [])
 
-        let normalPart = FileDownloader.partURL(for: normalFinal, fileID: "file-1")
-        let literalPartTemp = FileDownloader.partURL(for: literalPartFinal, fileID: "file-2")
+        let normalFinal = FileDownloader.destinationURL(baseDirectory: dir, file: normalFile)
+        let literalPartFinal = FileDownloader.destinationURL(baseDirectory: dir, file: literalPartFile)
 
+        let normalPart = FileDownloader.partURL(for: normalFile, in: dir)
+        let literalPartTemp = FileDownloader.partURL(for: literalPartFile, in: dir)
+
+        #expect(normalPart.deletingLastPathComponent().lastPathComponent == GoFileConfig.partialStagingDirectoryName)
+        #expect(normalPart != normalFinal)
         #expect(normalPart != literalPartFinal)
         #expect(normalPart != literalPartTemp)
         #expect(normalPart.pathExtension == "part")
 
-        let longName = String(repeating: "x", count: 240) + ".bin"
-        let longPart = FileDownloader.partURL(for: dir.appendingPathComponent(longName), fileID: "file-3")
+        let longFile = RemoteFile(
+            id: "file-3",
+            filename: String(repeating: "x", count: 240) + ".bin",
+            downloadLink: "https://example.com/3",
+            relativeDirectory: []
+        )
+        let longPart = FileDownloader.partURL(for: longFile, in: dir)
         let longMeta = FileDownloader.resumeMetaURL(for: longPart)
         #expect(longPart.lastPathComponent.utf8.count <= 255)
         #expect(longMeta.lastPathComponent.utf8.count <= 255)

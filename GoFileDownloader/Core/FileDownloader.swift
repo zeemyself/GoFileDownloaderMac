@@ -1,5 +1,7 @@
 import CryptoKit
+import Darwin
 import Foundation
+import os
 
 public struct FileDownloadProgress: Sendable {
     public let bytesReceived: Int64
@@ -21,6 +23,7 @@ public enum FileDownloadOutcome: Sendable, Equatable {
 }
 
 public struct FileDownloader: Sendable {
+    internal static let stagingLock = OSAllocatedUnfairLock<Void>(initialState: ())
     private let session: URLSession
 
     internal enum ContentRange: Equatable {
@@ -64,6 +67,10 @@ public struct FileDownloader: Sendable {
                 throw GoFileError.unsafePath(file.relativePath)
             }
         }
+        if let first = components.first,
+           FilenameResolver.caseFoldKey(first) == FilenameResolver.caseFoldKey(GoFileConfig.partialStagingDirectoryName) {
+            throw GoFileError.unsafePath(file.relativePath)
+        }
 
         guard let canonicalBase = resolveRealPath(baseDirectory) else {
             throw GoFileError.unsafePath(file.relativePath)
@@ -84,56 +91,80 @@ public struct FileDownloader: Sendable {
         return candidate
     }
 
+    /// Resolves symlinks left-to-right like POSIX path resolution, including dangling/non-existent tails,
+    /// without lexically collapsing `..` across unresolved parent symlinks.
     private static func resolveRealPath(_ url: URL, depth: Int = 0) -> URL? {
-        guard depth < 16 else { return nil }
-        let standardized = url.standardizedFileURL
+        guard depth < 32 else { return nil }
+        let rawPath = url.path
+        guard !rawPath.isEmpty else { return nil }
         let fm = FileManager.default
-        var missingComponents: [String] = []
-        var cursor = standardized
+        let parts = rawPath.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
 
-        while cursor.path != "/" {
-            if let attrs = try? fm.attributesOfItem(atPath: cursor.path) {
-                if (attrs[.type] as? FileAttributeType) == .typeSymbolicLink,
-                   let rawTarget = try? fm.destinationOfSymbolicLink(atPath: cursor.path) {
-                    let targetURL = rawTarget.hasPrefix("/")
-                        ? URL(fileURLWithPath: rawTarget)
-                        : cursor.deletingLastPathComponent().appendingPathComponent(rawTarget)
-                    guard var resolved = resolveRealPath(targetURL, depth: depth + 1) else {
-                        return nil
-                    }
-                    for component in missingComponents.reversed() {
-                        resolved.appendPathComponent(component, isDirectory: false)
-                    }
-                    return resolved.standardizedFileURL
-                }
-                break
+        var current = URL(fileURLWithPath: "/", isDirectory: true)
+        var index = 0
+        while index < parts.count {
+            let component = parts[index]
+            if component == "." {
+                index += 1
+                continue
             }
-            missingComponents.append(cursor.lastPathComponent)
-            cursor.deleteLastPathComponent()
+            if component == ".." {
+                if current.path != "/" {
+                    current.deleteLastPathComponent()
+                }
+                index += 1
+                continue
+            }
+
+            let next = current.appendingPathComponent(component, isDirectory: false)
+            if let attrs = try? fm.attributesOfItem(atPath: next.path),
+               (attrs[.type] as? FileAttributeType) == .typeSymbolicLink,
+               let rawTarget = try? fm.destinationOfSymbolicLink(atPath: next.path) {
+                var combinedPath: String
+                if rawTarget.hasPrefix("/") {
+                    combinedPath = rawTarget
+                } else if current.path == "/" {
+                    combinedPath = "/\(rawTarget)"
+                } else {
+                    combinedPath = "\(current.path)/\(rawTarget)"
+                }
+                let remaining = parts[(index + 1)...]
+                if !remaining.isEmpty {
+                    if !combinedPath.hasSuffix("/") {
+                        combinedPath += "/"
+                    }
+                    combinedPath += remaining.joined(separator: "/")
+                }
+                return resolveRealPath(URL(fileURLWithPath: combinedPath), depth: depth + 1)
+            }
+
+            current = next
+            index += 1
         }
 
-        var resolved = cursor.resolvingSymlinksInPath()
-        for component in missingComponents.reversed() {
-            resolved.appendPathComponent(component, isDirectory: false)
-        }
-        return resolved.standardizedFileURL
+        return current
     }
 
-    /// Collision-safe temporary `.part` path keyed by a short hash of `fileID` so literal `*.part` remote files never clash.
-    public static func partURL(for finalURL: URL, fileID: String) -> URL {
-        let idHash8 = String(GoFileAPI.sha256Hex(fileID).prefix(8))
-        let suffix = ".\(idHash8).part"
-        let maxNameBytes = 255 - suffix.utf8.count - 5 // keep room for ".meta" within 255-byte NAME_MAX
-        let truncatedName = FilenameResolver.truncatePreservingExtension(
-            finalURL.lastPathComponent,
-            maxBytes: maxNameBytes
-        )
-        let baseName = truncatedName.isEmpty ? "download" : truncatedName
-        return finalURL.deletingLastPathComponent().appendingPathComponent(baseName + suffix, isDirectory: false)
+    /// Staging `.part` path isolated inside `<baseDirectory>/.gofile-partial/` so remote filenames can never collide with temp artifacts.
+    public static func partURL(for file: RemoteFile, in baseDirectory: URL) -> URL {
+        let foldedPath = (file.relativeDirectory + [file.filename])
+            .map(FilenameResolver.caseFoldKey)
+            .joined(separator: "/")
+        let digest = String(GoFileAPI.sha256Hex("\(foldedPath)\0\(file.id)").prefix(32))
+        return baseDirectory
+            .appendingPathComponent(GoFileConfig.partialStagingDirectoryName, isDirectory: true)
+            .appendingPathComponent("\(digest).part", isDirectory: false)
     }
 
     internal static func resumeMetaURL(for partURL: URL) -> URL {
         partURL.appendingPathExtension("meta")
+    }
+
+    internal static func cleanupStagingDirectoryIfEmpty(in baseDirectory: URL) {
+        let stagingDir = baseDirectory.appendingPathComponent(GoFileConfig.partialStagingDirectoryName, isDirectory: true)
+        stagingLock.withLock {
+            _ = Darwin.rmdir(stagingDir.path)
+        }
     }
 
     internal static func parseContentRange(_ header: String) -> ContentRange? {
@@ -196,11 +227,13 @@ public struct FileDownloader: Sendable {
         let basePrefix = canonicalBase.path.hasSuffix("/") ? canonicalBase.path : canonicalBase.path + "/"
         let finalURL = try Self.validatedDestinationURL(baseDirectory: canonicalBase, file: file)
         let parentDir = finalURL.deletingLastPathComponent()
-        let partURL = Self.partURL(for: finalURL, fileID: file.id)
+        let stagingDir = canonicalBase.appendingPathComponent(GoFileConfig.partialStagingDirectoryName, isDirectory: true)
+        let partURL = Self.partURL(for: file, in: canonicalBase)
         let metaURL = Self.resumeMetaURL(for: partURL)
 
         if let attrs = try? fm.attributesOfItem(atPath: finalURL.path) {
-            if (attrs[.type] as? FileAttributeType) == .typeSymbolicLink {
+            let itemType = attrs[.type] as? FileAttributeType
+            guard itemType == .typeRegular else {
                 throw GoFileError.unsafePath(file.relativePath)
             }
             if let existingSize = attrs[.size] as? Int64 {
@@ -211,6 +244,20 @@ public struct FileDownloader: Sendable {
                 } else if existingSize > 0 {
                     return .skippedAlreadyExists(totalBytes: existingSize)
                 }
+            }
+        }
+
+        if let stagingAttrs = try? fm.attributesOfItem(atPath: stagingDir.path) {
+            let stagingType = stagingAttrs[.type] as? FileAttributeType
+            guard stagingType == .typeDirectory else {
+                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
+            }
+            guard let canonicalStaging = Self.resolveRealPath(stagingDir) else {
+                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
+            }
+            let stagingCheckPath = canonicalStaging.path.hasSuffix("/") ? canonicalStaging.path : canonicalStaging.path + "/"
+            guard stagingCheckPath.hasPrefix(basePrefix) else {
+                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
             }
         }
 
@@ -226,9 +273,11 @@ public struct FileDownloader: Sendable {
             throw GoFileError.unsafePath(file.relativePath)
         }
 
-        if let partAttrs = try? fm.attributesOfItem(atPath: partURL.path),
-           (partAttrs[.type] as? FileAttributeType) == .typeSymbolicLink {
-            throw GoFileError.unsafePath(file.relativePath)
+        for artifactURL in [partURL, metaURL] {
+            if let artifactAttrs = try? fm.attributesOfItem(atPath: artifactURL.path),
+               (artifactAttrs[.type] as? FileAttributeType) != .typeRegular {
+                throw GoFileError.unsafePath(file.relativePath)
+            }
         }
 
         var existingPartSize: Int64 = 0
@@ -277,20 +326,33 @@ public struct FileDownloader: Sendable {
             throw GoFileError.networkError("Invalid response for \(file.filename).")
         }
 
+        let responseETag = http.value(forHTTPHeaderField: "ETag")
+        let responseLastModified = http.value(forHTTPHeaderField: "Last-Modified")
+        let validatorMismatch: Bool = {
+            if let oldETag = savedMeta?.etag, let newETag = responseETag {
+                return oldETag != newETag
+            }
+            if let oldLM = savedMeta?.lastModified, let newLM = responseLastModified {
+                return oldLM != newLM
+            }
+            return false
+        }()
+
         // Handle 416 Range Not Satisfiable: rescue complete .part if server confirms exact size, else reset once without Range.
         if http.statusCode == 416 {
             if allowResume && existingPartSize > 0 {
-                if let crHeader = http.value(forHTTPHeaderField: "Content-Range"),
+                if !validatorMismatch,
+                   let crHeader = http.value(forHTTPHeaderField: "Content-Range"),
                    case let .unsatisfied(total)? = Self.parseContentRange(crHeader),
                    total == existingPartSize,
                    file.expectedSize == nil || file.expectedSize == total {
                     do {
                         try Self.verifyMD5IfPresent(fileURL: partURL, expectedMD5: file.md5)
                     } catch {
-                        try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL)
+                        try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
                         throw error
                     }
-                    try Self.promotePartFile(from: partURL, to: finalURL, metaURL: metaURL)
+                    try Self.promotePartFile(from: partURL, to: finalURL, metaURL: metaURL, baseDirectory: canonicalBase)
                     await onProgress(
                         FileDownloadProgress(
                             bytesReceived: total,
@@ -302,7 +364,7 @@ public struct FileDownloader: Sendable {
                     return .downloaded(totalBytes: total, resumed: true)
                 }
 
-                try Self.removePartArtifacts(partURL: partURL, metaURL: metaURL)
+                try Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
                 return try await downloadInternal(
                     file: file,
                     to: baseDirectory,
@@ -319,31 +381,25 @@ public struct FileDownloader: Sendable {
             throw GoFileError.httpError(http.statusCode)
         }
 
-        let responseETag = http.value(forHTTPHeaderField: "ETag")
-        let responseLastModified = http.value(forHTTPHeaderField: "Last-Modified")
-
         var contentRangeTotal: Int64?
+        var contentRangeLength: Int64?
         if isPartial {
             let parsedRange = http.value(forHTTPHeaderField: "Content-Range").flatMap(Self.parseContentRange)
-            let etagMismatch: Bool = {
-                guard let oldETag = savedMeta?.etag, let newETag = responseETag else { return false }
-                return oldETag != newETag
-            }()
             let rangeValid: Bool = {
                 guard allowResume, existingPartSize > 0,
                       case let .bytes(start, _, total)? = parsedRange,
                       start == existingPartSize else {
                     return false
                 }
-                if let total, let expected = file.expectedSize, expected > 0, total != expected {
+                if let total, let expected = file.expectedSize, expected >= 0, total != expected {
                     return false
                 }
                 return true
             }()
 
-            if !rangeValid || etagMismatch {
+            if !rangeValid || validatorMismatch {
                 if allowResume {
-                    try Self.removePartArtifacts(partURL: partURL, metaURL: metaURL)
+                    try Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
                     return try await downloadInternal(
                         file: file,
                         to: baseDirectory,
@@ -353,11 +409,12 @@ public struct FileDownloader: Sendable {
                     )
                 }
                 throw GoFileError.integrityMismatch(
-                    "Server returned mismatched Content-Range or ETag for resumed download of \(file.filename)."
+                    "Server returned mismatched Content-Range or validator for resumed download of \(file.filename)."
                 )
             }
-            if case let .bytes(_, _, total)? = parsedRange {
+            if case let .bytes(start, end, total)? = parsedRange {
                 contentRangeTotal = total
+                contentRangeLength = end - start + 1
             }
         }
 
@@ -379,35 +436,56 @@ public struct FileDownloader: Sendable {
                 if let contentLength {
                     return startingOffset + contentLength
                 }
+                if let contentRangeLength {
+                    return startingOffset + contentRangeLength
+                }
                 return file.expectedSize
             } else {
                 return contentLength ?? file.expectedSize
             }
         }()
 
-        if let expected = file.expectedSize, expected > 0,
+        if let expected = file.expectedSize, expected >= 0,
            let totalExpected, totalExpected != expected {
             throw GoFileError.integrityMismatch(
                 "Size mismatch for \(file.filename): expected \(expected) bytes, server reported \(totalExpected) bytes."
             )
         }
 
-        if !isPartial || !fm.fileExists(atPath: partURL.path) {
-            fm.createFile(atPath: partURL.path, contents: nil)
+        let handle: FileHandle = try Self.stagingLock.withLock {
+            let localFM = FileManager.default
+            if let existingAttrs = try? localFM.attributesOfItem(atPath: stagingDir.path),
+               (existingAttrs[.type] as? FileAttributeType) != .typeDirectory {
+                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
+            }
+            try localFM.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+            guard let canonicalStaging = Self.resolveRealPath(stagingDir) else {
+                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
+            }
+            let stagingCheckPath = canonicalStaging.path.hasSuffix("/") ? canonicalStaging.path : canonicalStaging.path + "/"
+            guard stagingCheckPath.hasPrefix(basePrefix) else {
+                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
+            }
+            if let partAttrs = try? localFM.attributesOfItem(atPath: partURL.path),
+               (partAttrs[.type] as? FileAttributeType) != .typeRegular {
+                throw GoFileError.unsafePath(file.relativePath)
+            }
+            if !isPartial || !localFM.fileExists(atPath: partURL.path) {
+                localFM.createFile(atPath: partURL.path, contents: nil)
+            }
+            return try FileHandle(forWritingTo: partURL)
         }
-
-        Self.saveResumeMetadata(
-            ResumeMetadata(etag: responseETag, lastModified: responseLastModified, expectedSize: totalExpected),
-            to: metaURL
-        )
-
-        let handle = try FileHandle(forWritingTo: partURL)
         defer { try? handle.close() }
         if isPartial {
             try handle.seekToEnd()
         } else {
             try handle.truncate(atOffset: 0)
         }
+
+        Self.saveResumeMetadata(
+            ResumeMetadata(etag: responseETag, lastModified: responseLastModified, expectedSize: totalExpected),
+            to: metaURL
+        )
 
         let flushSize = GoFileConfig.chunkSize(for: totalExpected ?? -1)
         var buffer = Data()
@@ -468,7 +546,7 @@ public struct FileDownloader: Sendable {
         // Verify exact completeness when expected length is known
         if let totalExpected, totalWritten != totalExpected {
             if totalWritten > totalExpected {
-                try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL)
+                try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
                 throw GoFileError.integrityMismatch(
                     "Received \(totalWritten) bytes for \(file.filename), expected \(totalExpected) bytes."
                 )
@@ -477,8 +555,8 @@ public struct FileDownloader: Sendable {
                 "Connection broken: IncompleteRead(\(totalWritten) bytes read, \(totalExpected - totalWritten) more expected)"
             )
         }
-        if let expected = file.expectedSize, expected > 0, totalWritten != expected {
-            try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL)
+        if let expected = file.expectedSize, expected >= 0, totalWritten != expected {
+            try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
             throw GoFileError.integrityMismatch(
                 "Downloaded \(totalWritten) bytes for \(file.filename), expected \(expected) bytes."
             )
@@ -487,11 +565,11 @@ public struct FileDownloader: Sendable {
         do {
             try Self.verifyMD5IfPresent(fileURL: partURL, expectedMD5: file.md5)
         } catch {
-            try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL)
+            try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
             throw error
         }
 
-        try Self.promotePartFile(from: partURL, to: finalURL, metaURL: metaURL)
+        try Self.promotePartFile(from: partURL, to: finalURL, metaURL: metaURL, baseDirectory: canonicalBase)
 
         await onProgress(
             FileDownloadProgress(
@@ -524,23 +602,31 @@ public struct FileDownloader: Sendable {
         }
     }
 
-    private static func promotePartFile(from partURL: URL, to finalURL: URL, metaURL: URL) throws {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: finalURL.path) {
-            _ = try fm.replaceItemAt(finalURL, withItemAt: partURL)
-        } else {
-            try fm.moveItem(at: partURL, to: finalURL)
+    private static func promotePartFile(from partURL: URL, to finalURL: URL, metaURL: URL, baseDirectory: URL) throws {
+        let stagingDir = baseDirectory.appendingPathComponent(GoFileConfig.partialStagingDirectoryName, isDirectory: true)
+        try stagingLock.withLock {
+            let fm = FileManager.default
+            if fm.fileExists(atPath: finalURL.path) {
+                _ = try fm.replaceItemAt(finalURL, withItemAt: partURL)
+            } else {
+                try fm.moveItem(at: partURL, to: finalURL)
+            }
+            try? fm.removeItem(at: metaURL)
+            _ = Darwin.rmdir(stagingDir.path)
         }
-        try? fm.removeItem(at: metaURL)
     }
 
-    private static func removePartArtifacts(partURL: URL, metaURL: URL) throws {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: partURL.path) {
-            try fm.removeItem(at: partURL)
-        }
-        if fm.fileExists(atPath: metaURL.path) {
-            try? fm.removeItem(at: metaURL)
+    private static func removePartArtifacts(partURL: URL, metaURL: URL, baseDirectory: URL) throws {
+        let stagingDir = baseDirectory.appendingPathComponent(GoFileConfig.partialStagingDirectoryName, isDirectory: true)
+        try stagingLock.withLock {
+            let fm = FileManager.default
+            if fm.fileExists(atPath: partURL.path) {
+                try fm.removeItem(at: partURL)
+            }
+            if fm.fileExists(atPath: metaURL.path) {
+                try? fm.removeItem(at: metaURL)
+            }
+            _ = Darwin.rmdir(stagingDir.path)
         }
     }
 

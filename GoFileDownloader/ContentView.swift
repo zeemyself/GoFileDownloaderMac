@@ -569,7 +569,7 @@ struct ContentView: View {
     }
 
     private func logEventColor(_ event: String) -> Color {
-        if event.contains("Failed") || event.contains("Invalid") || event.contains("Missing") {
+        if event.contains("Failed") || event.contains("Invalid") || event.contains("Missing") || event.contains("Wrong") {
             return .red
         } else if event.contains("Retry") || event.contains("Cancel") {
             return .orange

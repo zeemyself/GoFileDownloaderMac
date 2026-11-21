@@ -255,7 +255,9 @@ public actor GoFileAPI {
         var rawFiles: [RemoteFile] = []
         var visitedFolderIDs = Set<String>()
         var seenFileIDs = Set<String>()
-        var reservedNamesByDir: [[String]: Set<String>] = [:]
+        var reservedNamesByDir: [[String]: Set<String>] = [
+            []: [FilenameResolver.caseFoldKey(GoFileConfig.partialStagingDirectoryName)]
+        ]
 
         try await parseLinks(
             identifier: contentID,
@@ -298,11 +300,16 @@ public actor GoFileAPI {
         reservedNamesByDir: inout [[String]: Set<String>],
         into files: inout [RemoteFile]
     ) async throws {
-        guard depth <= GoFileConfig.maxFolderRecursionDepth else { return }
+        guard depth <= GoFileConfig.maxFolderRecursionDepth else {
+            throw GoFileError.apiError(
+                "Folder nesting exceeds maximum depth (\(GoFileConfig.maxFolderRecursionDepth))."
+            )
+        }
         guard visitedFolderIDs.insert(identifier).inserted else { return }
 
         var rootNode: ContentNode?
         var allChildren: [String: ContentNode] = [:]
+        var hasMorePagesAfterCap = false
 
         for page in 1...GoFileConfig.maxPaginationPages {
             try Task.checkCancellation()
@@ -388,12 +395,32 @@ public actor GoFileAPI {
             guard response.metadata?.hasNextPage == true, !pageChildren.isEmpty else {
                 break
             }
+            if page == GoFileConfig.maxPaginationPages {
+                hasMorePagesAfterCap = true
+            }
+        }
+
+        if hasMorePagesAfterCap {
+            throw GoFileError.apiError(
+                "Folder '\(rootNode?.name ?? identifier)' exceeds maximum pagination limit (\(GoFileConfig.maxPaginationPages) pages)."
+            )
         }
 
         guard let node = rootNode else { return }
 
         if node.type == "folder" {
-            let folderName = resolvedFolderName ?? Self.sanitizePathComponent(node.name ?? identifier)
+            let folderName: String
+            if let resolvedFolderName {
+                folderName = resolvedFolderName
+            } else {
+                let foldedParentDir = currentPath.map(FilenameResolver.caseFoldKey)
+                var reserved = reservedNamesByDir[foldedParentDir, default: Set<String>()]
+                folderName = FilenameResolver.resolveUniqueFilename(
+                    Self.sanitizePathComponent(node.name ?? identifier),
+                    usedNames: &reserved
+                )
+                reservedNamesByDir[foldedParentDir] = reserved
+            }
             let nextPath = currentPath + [folderName]
             let foldedNextDir = nextPath.map(FilenameResolver.caseFoldKey)
 
