@@ -26,7 +26,7 @@ A native macOS app written in Swift 6 and SwiftUI for downloading files and fold
 2. Select the **GoFileDownloader** scheme.
 3. Build and run (`⌘R`).
 
-> The project uses ad-hoc signing (`CODE_SIGN_IDENTITY = "-"`) with App Sandbox disabled, so no Apple Developer account is required for local builds.
+> Local builds default to ad-hoc signing (`CODE_SIGN_IDENTITY = "-"`) with Hardened Runtime enabled in Release and App Sandbox disabled, so no Apple Developer account is required locally. For distribution and notarization on other Macs, override `CODE_SIGN_IDENTITY`, `DEVELOPMENT_TEAM`, and `PRODUCT_BUNDLE_IDENTIFIER` on `xcodebuild`.
 
 ### Command Line
 
@@ -35,11 +35,12 @@ xcodebuild \
   -project GoFileDownloader.xcodeproj \
   -scheme GoFileDownloader \
   -configuration Release \
+  -destination 'generic/platform=macOS' \
   -derivedDataPath build \
   build
 ```
 
-The built app bundle will be located at `build/Build/Products/Release/GoFileDownloader.app`.
+The built Universal (`arm64` + `x86_64`) app bundle will be located at `build/Build/Products/Release/GoFileDownloader.app`.
 
 ## Usage
 
@@ -117,11 +118,16 @@ Tests use Apple's **Swift Testing** framework. Run unit tests in Xcode (`⌘U`) 
 xcodebuild test \
   -project GoFileDownloader.xcodeproj \
   -scheme GoFileDownloader \
+  -destination 'platform=macOS' \
   -derivedDataPath build
 ```
 
-`LiveSmokeTests` makes live network requests against the GoFile API and is skipped by default. To enable it, create `/tmp/gofile_live_enable` before running tests:
+`LiveSmokeTests` makes live network requests against the GoFile API and is skipped by default. To enable it, pass `GOFILE_LIVE_TESTS=1` (and optionally `GOFILE_LIVE_URL` / `GOFILE_LIVE_PASSWORD`):
 
 ```bash
-touch /tmp/gofile_live_enable
+GOFILE_LIVE_TESTS=1 xcodebuild test \
+  -project GoFileDownloader.xcodeproj \
+  -scheme GoFileDownloader \
+  -destination 'platform=macOS' \
+  -derivedDataPath build
 ```

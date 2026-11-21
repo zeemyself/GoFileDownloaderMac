@@ -1,39 +1,50 @@
-import CryptoKit
 import Foundation
 import os
 import Testing
 @testable import GoFileDownloader
 
-final class MockURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
-
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-    override func startLoading() {
-        guard let handler = Self.handler else {
-            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
-            return
-        }
-        do {
-            let (response, data) = try handler(request)
-            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: data)
-            client?.urlProtocolDidFinishLoading(self)
-        } catch {
-            client?.urlProtocol(self, didFailWithError: error)
-        }
-    }
-
-    override func stopLoading() {}
-}
-
-@Suite("Contents Parsing & Resume Tests", .serialized)
+@Suite("GoFileAPI Resolution & Account Tests")
 struct ContentsParsingTests {
-    private func makeMockSession() -> URLSession {
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockURLProtocol.self]
-        return URLSession(configuration: config)
+    @Test("createAccountToken succeeds and handles HTTP, decode, empty token, and cancellation errors")
+    func accountTokenLifecycle() async throws {
+        let mock = MockSessionScope { request in
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data(#"{"status":"ok","data":{"token":"guest-tok-99"}}"#.utf8))
+        }
+        defer { mock.invalidate() }
+
+        let api = GoFileAPI(session: mock.session)
+        let token = try await api.createAccountToken()
+        #expect(token == "guest-tok-99")
+
+        mock.update { request in
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 503, httpVersion: nil, headerFields: nil)!
+            return (resp, Data("Service Unavailable".utf8))
+        }
+        await #expect(throws: GoFileError.httpError(503)) {
+            _ = try await api.createAccountToken()
+        }
+
+        mock.update { request in
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data("not json".utf8))
+        }
+        await #expect(throws: GoFileError.apiError("Failed to decode account response")) {
+            _ = try await api.createAccountToken()
+        }
+
+        mock.update { request in
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data(#"{"status":"ok","data":{"token":""}}"#.utf8))
+        }
+        await #expect(throws: GoFileError.accountCreationFailed) {
+            _ = try await api.createAccountToken()
+        }
+
+        mock.update { _ in throw URLError(.cancelled) }
+        await #expect(throws: CancellationError.self) {
+            _ = try await api.createAccountToken()
+        }
     }
 
     @Test("Resolves folder hierarchy and deduplicates duplicate filenames")
@@ -53,13 +64,13 @@ struct ContentsParsingTests {
         }
         """
 
-        MockURLProtocol.handler = { request in
+        let mock = MockSessionScope { request in
             let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             return (resp, Data(payload.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.invalidate() }
 
-        let api = GoFileAPI(session: makeMockSession())
+        let api = GoFileAPI(session: mock.session)
         let files = try await api.resolveFiles(contentID: "abc123", plainPassword: nil, accountToken: "tok")
 
         #expect(files.count == 3)
@@ -68,270 +79,138 @@ struct ContentsParsingTests {
         #expect(files[2].relativePath == "album/clip (2).mp4")
     }
 
-    @Test("Throws passwordRequired when passwordStatus is not passwordOk")
-    func throwsPasswordRequired() async {
-        let payload = """
+    @Test("Resolves single-file root link and multi-page folder pagination")
+    func singleFileAndPagination() async throws {
+        let singleFileJSON = """
         {
           "status": "ok",
           "data": {
-            "type": "folder",
-            "name": "secret",
-            "password": true,
-            "passwordStatus": "passwordRequired"
+            "id": "single-1",
+            "type": "file",
+            "name": "report.pdf",
+            "link": "https://store1.gofile.io/download/report.pdf",
+            "size": 1024,
+            "md5": "0123456789abcdef0123456789abcdef"
           }
         }
         """
 
-        MockURLProtocol.handler = { request in
+        let mock = MockSessionScope { request in
             let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (resp, Data(payload.utf8))
+            return (resp, Data(singleFileJSON.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.invalidate() }
 
-        let api = GoFileAPI(session: makeMockSession())
+        let api = GoFileAPI(session: mock.session)
+        let singleFiles = try await api.resolveFiles(contentID: "single-1", plainPassword: nil, accountToken: "tok")
+        #expect(singleFiles.count == 1)
+        #expect(singleFiles[0].relativePath == "report.pdf")
+        #expect(singleFiles[0].expectedSize == 1024)
+        #expect(singleFiles[0].md5 == "0123456789abcdef0123456789abcdef")
+
+        // Paginated folder across 2 pages
+        let page1JSON = """
+        {
+          "status": "ok",
+          "metadata": { "hasNextPage": true },
+          "data": {
+            "id": "paged",
+            "type": "folder",
+            "name": "BigAlbum",
+            "children": {
+              "f1": { "id": "f1", "type": "file", "name": "one.txt", "link": "https://example.com/1", "createTime": 1 }
+            }
+          }
+        }
+        """
+        let page2JSON = """
+        {
+          "status": "ok",
+          "metadata": { "hasNextPage": false },
+          "data": {
+            "id": "paged",
+            "type": "folder",
+            "name": "BigAlbum",
+            "children": {
+              "f2": { "id": "f2", "type": "file", "name": "two.txt", "link": "https://example.com/2", "createTime": 2 }
+            }
+          }
+        }
+        """
+        mock.update { request in
+            let isPage2 = request.url?.query?.contains("page=2") == true
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data((isPage2 ? page2JSON : page1JSON).utf8))
+        }
+        let pagedFiles = try await api.resolveFiles(contentID: "paged", plainPassword: nil, accountToken: "tok")
+        #expect(pagedFiles.map(\.filename) == ["one.txt", "two.txt"])
+    }
+
+    @Test("Password handling distinguishes required, wrong, ok, and explicit falsy password values")
+    func passwordStatesAndFalsyValues() async throws {
+        let mock = MockSessionScope { request in
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data(#"{"status":"ok","data":{"type":"folder","name":"secret","password":true,"passwordStatus":"passwordRequired"}}"#.utf8))
+        }
+        defer { mock.invalidate() }
+
+        let api = GoFileAPI(session: mock.session)
         await #expect(throws: GoFileError.passwordRequired) {
             _ = try await api.resolveFiles(contentID: "sec1", plainPassword: nil, accountToken: "tok")
         }
-    }
 
-    @Test("FileDownloader resumes from existing .part file using HTTP Range")
-    func resumesPartialDownload() async throws {
-        let fullData = Data("Hello, resumable GoFile world!".utf8)
-        let partialPrefix = fullData.prefix(7) // "Hello, "
-        let remainingSuffix = fullData.dropFirst(7)
-
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-
-        let remoteFile = RemoteFile(
-            id: "f1",
-            filename: "sample.txt",
-            downloadLink: "https://example.com/sample.txt",
-            relativeDirectory: ["album"],
-            expectedSize: Int64(fullData.count)
-        )
-
-        let finalURL = FileDownloader.destinationURL(baseDirectory: tempDir, file: remoteFile)
-        let partURL = FileDownloader.partURL(for: remoteFile, in: tempDir)
-        try FileManager.default.createDirectory(at: partURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try partialPrefix.write(to: partURL)
-
-        let capturedRangeHeader = OSAllocatedUnfairLock<String?>(initialState: nil)
-        MockURLProtocol.handler = { request in
-            capturedRangeHeader.withLock { $0 = request.value(forHTTPHeaderField: "Range") }
-            let headers = [
-                "Content-Length": "\(remainingSuffix.count)",
-                "Content-Range": "bytes 7-\(fullData.count - 1)/\(fullData.count)",
-            ]
-            let resp = HTTPURLResponse(url: request.url!, statusCode: 206, httpVersion: nil, headerFields: headers)!
-            return (resp, Data(remainingSuffix))
+        mock.update { request in
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data(#"{"status":"ok","data":{"type":"folder","name":"secret","password":true,"passwordStatus":"passwordWrong"}}"#.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        await #expect(throws: GoFileError.wrongPassword) {
+            _ = try await api.resolveFiles(contentID: "sec1", plainPassword: "bad", accountToken: "tok")
+        }
 
-        let downloader = FileDownloader(session: makeMockSession())
-        let outcome = try await downloader.download(
-            file: remoteFile,
-            to: tempDir,
-            accountToken: "tok"
-        ) { _ in }
-
-        #expect(capturedRangeHeader.withLock { $0 } == "bytes=7-")
-        #expect(outcome == .downloaded(totalBytes: Int64(fullData.count), resumed: true))
-        #expect(FileManager.default.fileExists(atPath: finalURL.path))
-        #expect(!FileManager.default.fileExists(atPath: partURL.path))
-        let saved = try Data(contentsOf: finalURL)
-        #expect(saved == fullData)
-    }
-
-    // MARK: - P0 Regressions
-
-    @Test("Misaligned 206 Content-Range restarts cleanly from byte 0 without splicing")
-    func misaligned206RestartsCleanly() async throws {
-        let fullData = Data("0123456789ABCDEF".utf8)
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-
-        let remoteFile = RemoteFile(
-            id: "f-misalign",
-            filename: "data.bin",
-            downloadLink: "https://example.com/data.bin",
-            relativeDirectory: [],
-            expectedSize: Int64(fullData.count)
-        )
-        let finalURL = FileDownloader.destinationURL(baseDirectory: tempDir, file: remoteFile)
-        let partURL = FileDownloader.partURL(for: remoteFile, in: tempDir)
-        try FileManager.default.createDirectory(at: partURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("STALE!!".utf8).write(to: partURL)
-
-        let callCount = OSAllocatedUnfairLock<Int>(initialState: 0)
-        MockURLProtocol.handler = { request in
-            let attempt = callCount.withLock { count in
-                count += 1
-                return count
+        mock.update { request in
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data("""
+            {
+              "status": "ok",
+              "data": {
+                "type": "folder",
+                "name": "secret",
+                "password": true,
+                "passwordStatus": "passwordOk",
+                "children": {
+                  "f1": { "id": "f1", "type": "file", "name": "ok.txt", "link": "https://example.com/ok" }
+                }
+              }
             }
-            if attempt == 1 {
-                let headers = [
-                    "Content-Length": "\(fullData.count)",
-                    "Content-Range": "bytes 0-\(fullData.count - 1)/\(fullData.count)",
-                ]
-                let resp = HTTPURLResponse(url: request.url!, statusCode: 206, httpVersion: nil, headerFields: headers)!
-                return (resp, fullData)
+            """.utf8))
+        }
+        let unlocked = try await api.resolveFiles(contentID: "sec1", plainPassword: "good", accountToken: "tok")
+        #expect(unlocked.count == 1)
+
+        // Explicit falsy password values (false, "", 0) must NOT trigger passwordRequired
+        for falsyLiteral in ["false", "\"\"", "0", "\"false\"", "null"] {
+            mock.update { request in
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (resp, Data("""
+                {
+                  "status": "ok",
+                  "data": {
+                    "type": "folder",
+                    "name": "public",
+                    "password": \(falsyLiteral),
+                    "children": {
+                      "f1": { "id": "f1", "type": "file", "name": "open.txt", "link": "https://example.com/open" }
+                    }
+                  }
+                }
+                """.utf8))
             }
-            let headers = ["Content-Length": "\(fullData.count)"]
-            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: headers)!
-            return (resp, fullData)
+            let files = try await api.resolveFiles(contentID: "pub1", plainPassword: nil, accountToken: "tok")
+            #expect(files.count == 1)
         }
-        defer { MockURLProtocol.handler = nil }
-
-        let downloader = FileDownloader(session: makeMockSession())
-        let outcome = try await downloader.download(file: remoteFile, to: tempDir, accountToken: "tok") { _ in }
-
-        #expect(callCount.withLock { $0 } == 2)
-        #expect(outcome == .downloaded(totalBytes: Int64(fullData.count), resumed: false))
-        #expect(try Data(contentsOf: finalURL) == fullData)
     }
 
-    @Test("HTTP 416 rescues already-complete .part file and caps retry count at 1")
-    func handles416RescueAndRetryCap() async throws {
-        let fullData = Data("Already complete part bytes".utf8)
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-
-        let completeFile = RemoteFile(
-            id: "f-416-rescue",
-            filename: "complete.bin",
-            downloadLink: "https://example.com/complete.bin",
-            relativeDirectory: [],
-            expectedSize: Int64(fullData.count)
-        )
-        let completeFinal = FileDownloader.destinationURL(baseDirectory: tempDir, file: completeFile)
-        let completePart = FileDownloader.partURL(for: completeFile, in: tempDir)
-        try FileManager.default.createDirectory(at: completePart.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fullData.write(to: completePart)
-
-        let rescueRequests = OSAllocatedUnfairLock<Int>(initialState: 0)
-        MockURLProtocol.handler = { request in
-            rescueRequests.withLock { $0 += 1 }
-            let resp = HTTPURLResponse(
-                url: request.url!,
-                statusCode: 416,
-                httpVersion: nil,
-                headerFields: ["Content-Range": "bytes */\(fullData.count)"]
-            )!
-            return (resp, Data())
-        }
-        defer { MockURLProtocol.handler = nil }
-
-        let downloader = FileDownloader(session: makeMockSession())
-        let outcome = try await downloader.download(file: completeFile, to: tempDir, accountToken: "tok") { _ in }
-
-        #expect(rescueRequests.withLock { $0 } == 1)
-        #expect(outcome == .downloaded(totalBytes: Int64(fullData.count), resumed: true))
-        #expect(try Data(contentsOf: completeFinal) == fullData)
-
-        // Repeated 416 must not infinitely recurse
-        let badFile = RemoteFile(
-            id: "f-416-loop",
-            filename: "broken.bin",
-            downloadLink: "https://example.com/broken.bin",
-            relativeDirectory: [],
-            expectedSize: nil
-        )
-        let badPart = FileDownloader.partURL(for: badFile, in: tempDir)
-        try FileManager.default.createDirectory(at: badPart.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("stale".utf8).write(to: badPart)
-
-        let loopRequests = OSAllocatedUnfairLock<Int>(initialState: 0)
-        MockURLProtocol.handler = { request in
-            loopRequests.withLock { $0 += 1 }
-            let resp = HTTPURLResponse(url: request.url!, statusCode: 416, httpVersion: nil, headerFields: nil)!
-            return (resp, Data())
-        }
-
-        await #expect(throws: GoFileError.httpError(416)) {
-            _ = try await downloader.download(file: badFile, to: tempDir, accountToken: "tok") { _ in }
-        }
-        #expect(loopRequests.withLock { $0 } == 2)
-    }
-
-    @Test("Rejects soft-200 size mismatch, MD5 mismatch, and accepts matching MD5")
-    func rejectsSoft200AndVerifiesMD5() async throws {
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-
-        let htmlError = Data("<html>Rate limited</html>".utf8)
-        let largeRemote = RemoteFile(
-            id: "f-soft200",
-            filename: "movie.mp4",
-            downloadLink: "https://example.com/movie.mp4",
-            relativeDirectory: [],
-            expectedSize: 50_000
-        )
-
-        MockURLProtocol.handler = { request in
-            let resp = HTTPURLResponse(
-                url: request.url!,
-                statusCode: 200,
-                httpVersion: nil,
-                headerFields: ["Content-Length": "\(htmlError.count)"]
-            )!
-            return (resp, htmlError)
-        }
-        defer { MockURLProtocol.handler = nil }
-
-        let downloader = FileDownloader(session: makeMockSession())
-        await #expect(throws: GoFileError.integrityMismatch(
-            "Size mismatch for movie.mp4: expected 50000 bytes, server reported \(htmlError.count) bytes."
-        )) {
-            _ = try await downloader.download(file: largeRemote, to: tempDir, accountToken: "tok") { _ in }
-        }
-        let movieURL = FileDownloader.destinationURL(baseDirectory: tempDir, file: largeRemote)
-        #expect(!FileManager.default.fileExists(atPath: movieURL.path))
-
-        // MD5 mismatch vs match
-        let payload = Data("Verified payload content".utf8)
-        let actualMD5 = Insecure.MD5.hash(data: payload).map { String(format: "%02x", $0) }.joined()
-        let wrongMD5 = String(repeating: "0", count: 32)
-
-        MockURLProtocol.handler = { request in
-            let resp = HTTPURLResponse(
-                url: request.url!,
-                statusCode: 200,
-                httpVersion: nil,
-                headerFields: ["Content-Length": "\(payload.count)"]
-            )!
-            return (resp, payload)
-        }
-
-        let badHashFile = RemoteFile(
-            id: "f-badmd5",
-            filename: "check.bin",
-            downloadLink: "https://example.com/check.bin",
-            relativeDirectory: [],
-            expectedSize: Int64(payload.count),
-            md5: wrongMD5
-        )
-        await #expect(throws: GoFileError.checksumMismatch(expected: wrongMD5, actual: actualMD5)) {
-            _ = try await downloader.download(file: badHashFile, to: tempDir, accountToken: "tok") { _ in }
-        }
-
-        let goodHashFile = RemoteFile(
-            id: "f-goodmd5",
-            filename: "check.bin",
-            downloadLink: "https://example.com/check.bin",
-            relativeDirectory: [],
-            expectedSize: Int64(payload.count),
-            md5: actualMD5
-        )
-        let okOutcome = try await downloader.download(file: goodHashFile, to: tempDir, accountToken: "tok") { _ in }
-        #expect(okOutcome == .downloaded(totalBytes: Int64(payload.count), resumed: false))
-    }
-
-    @Test("GoFileAPI handles deterministic sorting, APFS folder collisions, cycles, HTTP errors, and password redaction")
+    @Test("Handles deterministic sorting, APFS folder collisions, cycles, API error mapping, and password redaction")
     func apiSafetyOrderingAndRedaction() async throws {
         let cyclicPayload = """
         {
@@ -377,22 +256,15 @@ struct ContentsParsingTests {
         }
         """
 
-        MockURLProtocol.handler = { request in
+        let mock = MockSessionScope { request in
             let path = request.url?.path ?? ""
-            let json: String
-            if path.hasSuffix("/f-1") {
-                json = sub1
-            } else if path.hasSuffix("/f-2") {
-                json = sub2
-            } else {
-                json = cyclicPayload
-            }
+            let json = path.hasSuffix("/f-1") ? sub1 : (path.hasSuffix("/f-2") ? sub2 : cyclicPayload)
             let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             return (resp, Data(json.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.invalidate() }
 
-        let api = GoFileAPI(session: makeMockSession())
+        let api = GoFileAPI(session: mock.session)
         let files = try await api.resolveFiles(contentID: "root", plainPassword: nil, accountToken: "tok")
 
         #expect(files.count == 4)
@@ -403,10 +275,27 @@ struct ContentsParsingTests {
         #expect(files[2].relativePath == "Root/Photos/a.jpg")
         #expect(files[3].relativePath == "Root/photos (1)/a.jpg")
 
-        // Verify password redaction, HTTP status validation, and CancellationError propagation
+        // API status mappings
+        mock.update { request in
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data(#"{"status":"error-notFound"}"#.utf8))
+        }
+        await #expect(throws: GoFileError.notFound("missing1")) {
+            _ = try await api.resolveFiles(contentID: "missing1", plainPassword: nil, accountToken: "tok")
+        }
+
+        mock.update { request in
+            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (resp, Data(#"{"status":"error-notPublic"}"#.utf8))
+        }
+        await #expect(throws: GoFileError.notPublic("priv1")) {
+            _ = try await api.resolveFiles(contentID: "priv1", plainPassword: nil, accountToken: "tok")
+        }
+
+        // HTTP status, password redaction, and cancellation propagation
         let secret = "SuperSecret123"
         let secretHash = GoFileAPI.sha256Hex(secret)
-        MockURLProtocol.handler = { request in
+        mock.update { request in
             let resp = HTTPURLResponse(url: request.url!, statusCode: 429, httpVersion: nil, headerFields: nil)!
             return (resp, Data("Too Many Requests".utf8))
         }
@@ -414,9 +303,7 @@ struct ContentsParsingTests {
             _ = try await api.resolveFiles(contentID: "root", plainPassword: secret, accountToken: "tok")
         }
 
-        MockURLProtocol.handler = { _ in
-            throw URLError(.cannotFindHost)
-        }
+        mock.update { _ in throw URLError(.cannotFindHost) }
         do {
             _ = try await api.resolveFiles(contentID: "root", plainPassword: secret, accountToken: "tok")
             Issue.record("Expected networkError")
@@ -426,211 +313,16 @@ struct ContentsParsingTests {
             #expect(!desc.contains("password="))
         }
 
-        MockURLProtocol.handler = { _ in
-            throw URLError(.cancelled)
-        }
+        mock.update { _ in throw URLError(.cancelled) }
         await #expect(throws: CancellationError.self) {
             _ = try await api.resolveFiles(contentID: "root", plainPassword: secret, accountToken: "tok")
         }
     }
 
-    @Test("DownloadStore handles cancel-during-manual-retry, maxConcurrent cap, duplicate IDs, and forceRestart error")
-    @MainActor
-    func downloadStoreRegressions() async throws {
-        let suiteName = "gfd.test.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-
-        let accountJSON = #"{"status":"ok","data":{"token":"tok-1"}}"#
-        let contentsJSON = """
-        {
-          "status": "ok",
-          "data": {
-            "id": "album1",
-            "type": "folder",
-            "name": "album1",
-            "children": {
-              "f1": { "id": "f1", "type": "file", "name": "a.txt", "link": "https://cdn.example.com/a", "size": 5, "createTime": 1 },
-              "f2": { "id": "f2", "type": "file", "name": "b.txt", "link": "https://cdn.example.com/b", "size": 5, "createTime": 2 },
-              "f3": { "id": "f3", "type": "file", "name": "c.txt", "link": "https://cdn.example.com/c", "size": 5, "createTime": 3 },
-              "f4": { "id": "f4", "type": "file", "name": "d.txt", "link": "https://cdn.example.com/d", "size": 5, "createTime": 4 }
-            }
-          }
-        }
-        """
-
-        let inFlight = OSAllocatedUnfairLock<Int>(initialState: 0)
-        let peakConcurrent = OSAllocatedUnfairLock<Int>(initialState: 0)
-
-        MockURLProtocol.handler = { request in
-            let urlStr = request.url?.absoluteString ?? ""
-            if urlStr.contains("/accounts") {
-                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-                return (resp, Data(accountJSON.utf8))
-            }
-            if urlStr.contains("/contents/") {
-                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-                return (resp, Data(contentsJSON.utf8))
-            }
-            let currentCount = inFlight.withLock { current in
-                current += 1
-                return current
-            }
-            peakConcurrent.withLock { peak in
-                peak = max(peak, currentCount)
-            }
-            defer { inFlight.withLock { $0 -= 1 } }
-            Thread.sleep(forTimeInterval: 0.04)
-            let resp = HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!
-            return (resp, Data())
-        }
-        defer { MockURLProtocol.handler = nil }
-
-        let session = makeMockSession()
-        let store = DownloadStore(
-            api: GoFileAPI(session: session),
-            engine: DownloadEngine(fileDownloader: FileDownloader(session: session)),
-            userDefaults: defaults
-        )
-        store.downloadFolder = tempDir
-        store.urlInput = "https://gofile.io/d/album1"
-        store.maxConcurrent = 2
-        store.maxRetries = 0
-
-        store.startDownload()
-
-        // Wait until all 4 items fail cleanly
-        for _ in 0..<200 {
-            if case .failed = store.state, store.items.count == 4 { break }
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        #expect(store.failedFilesCount == 4)
-        #expect(peakConcurrent.withLock { $0 } <= 2)
-
-        // Bulk retry 4 failed items with maxConcurrent=2 and maxRetries=2, then cancel mid-retry
-        peakConcurrent.withLock { $0 = 0 }
-        store.maxRetries = 2
-        store.retryItems(withIDs: Set(store.items.map(\.id)))
-
-        for _ in 0..<80 {
-            let anyActive = store.items.contains {
-                if case .downloading = $0.status { return true }
-                if case .retrying = $0.status { return true }
-                return false
-            }
-            if anyActive { break }
-            try await Task.sleep(for: .milliseconds(15))
-        }
-
-        // Retrying a still-queued item while queued must be ignored
-        if let queuedItem = store.items.first(where: { $0.status == .queued }) {
-            let logCountBefore = store.logs.count
-            store.retryItem(queuedItem)
-            #expect(store.logs.count == logCountBefore)
-        }
-
-        store.cancelDownload()
-        #expect(store.state == .cancelled)
-        #expect(store.canStart)
-        #expect(store.items.allSatisfy { $0.status == .cancelled })
-        #expect(peakConcurrent.withLock { $0 } <= 2)
-
-        try await Task.sleep(for: .milliseconds(100))
-        #expect(store.state == .cancelled)
-
-        // Verify forceRestart does not silently become .skipped when deletion fails
-        let item = store.items[0]
-        let parentDir = item.destinationURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
-        try Data("locked".utf8).write(to: item.destinationURL)
-        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: parentDir.path)
-        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parentDir.path) }
-
-        store.retryItem(item, forceRestart: true)
-        if case .failed = item.status {
-            // Expected
-        } else {
-            Issue.record("Expected failed status when forceRestart cannot remove existing file, got \(item.status)")
-        }
-
-        // Verify duplicate IDs do not crash Dictionary(uniqueKeysWithValues:) and cancel-during-resolve sets .cancelled
-        MockURLProtocol.handler = { request in
-            let urlStr = request.url?.absoluteString ?? ""
-            if urlStr.contains("/accounts") {
-                Thread.sleep(forTimeInterval: 0.08)
-                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-                return (resp, Data(accountJSON.utf8))
-            }
-            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (resp, Data(contentsJSON.utf8))
-        }
-
-        store.startDownload()
-        #expect(store.state == .resolving)
-        store.cancelDownload()
-        #expect(store.state == .cancelled)
-        try await Task.sleep(for: .milliseconds(120))
-        #expect(store.state == .cancelled)
-    }
-
-    @Test("Literal .part remote file does not collide with active .part temp file")
-    func literalPartFileDoesNotCollide() async throws {
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-
-        let videoData = Data("MP4-VIDEO-BYTES".utf8)
-        let partData = Data("LITERAL-PART-FILE".utf8)
-
-        MockURLProtocol.handler = { request in
-            let data = request.url?.lastPathComponent == "clip.mp4.part" ? partData : videoData
-            let resp = HTTPURLResponse(
-                url: request.url!,
-                statusCode: 200,
-                httpVersion: nil,
-                headerFields: ["Content-Length": "\(data.count)"]
-            )!
-            return (resp, data)
-        }
-        defer { MockURLProtocol.handler = nil }
-
-        let downloader = FileDownloader(session: makeMockSession())
-        let videoFile = RemoteFile(
-            id: "id-video",
-            filename: "clip.mp4",
-            downloadLink: "https://example.com/clip.mp4",
-            relativeDirectory: [],
-            expectedSize: Int64(videoData.count)
-        )
-        let partNamedFile = RemoteFile(
-            id: "id-literal-part",
-            filename: "clip.mp4.part",
-            downloadLink: "https://example.com/clip.mp4.part",
-            relativeDirectory: [],
-            expectedSize: Int64(partData.count)
-        )
-
-        let out1 = try await downloader.download(file: videoFile, to: tempDir, accountToken: "tok") { _ in }
-        let out2 = try await downloader.download(file: partNamedFile, to: tempDir, accountToken: "tok") { _ in }
-
-        #expect(out1 == .downloaded(totalBytes: Int64(videoData.count), resumed: false))
-        #expect(out2 == .downloaded(totalBytes: Int64(partData.count), resumed: false))
-        #expect(try Data(contentsOf: tempDir.appendingPathComponent("clip.mp4")) == videoData)
-        #expect(try Data(contentsOf: tempDir.appendingPathComponent("clip.mp4.part")) == partData)
-        // Staging directory should be cleaned up once no active .part files remain
-        let stagingDir = tempDir.appendingPathComponent(GoFileConfig.partialStagingDirectoryName)
-        #expect(!FileManager.default.fileExists(atPath: stagingDir.path))
-    }
-
-    @Test("Reports pagination overflow and recursion depth overflow instead of returning partial manifests")
-    func reportsPaginationAndDepthOverflow() async throws {
-        // Pagination overflow: still reports hasNextPage == true after maxPaginationPages
+    @Test("Reports pagination overflow, recursion depth overflow, and renames staging-dir collisions")
+    func reportsPaginationDepthOverflowAndStagingRename() async throws {
         let pageCount = OSAllocatedUnfairLock<Int>(initialState: 0)
-        MockURLProtocol.handler = { request in
+        let mock = MockSessionScope { request in
             let p = pageCount.withLock { c in c += 1; return c }
             let json = """
             {
@@ -646,12 +338,11 @@ struct ContentsParsingTests {
               }
             }
             """
-            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (resp, Data(json.utf8))
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(json.utf8))
         }
-        defer { MockURLProtocol.handler = nil }
+        defer { mock.invalidate() }
 
-        let api = GoFileAPI(session: makeMockSession())
+        let api = GoFileAPI(session: mock.session)
         do {
             _ = try await api.resolveFiles(contentID: "huge", plainPassword: nil, accountToken: "tok")
             Issue.record("Expected pagination overflow error")
@@ -660,8 +351,8 @@ struct ContentsParsingTests {
         }
         #expect(pageCount.withLock { $0 } == GoFileConfig.maxPaginationPages)
 
-        // Recursion depth overflow: chain of folders deeper than maxFolderRecursionDepth
-        MockURLProtocol.handler = { request in
+        // Recursion depth overflow
+        mock.update { request in
             let currentID = request.url?.lastPathComponent ?? "d0"
             let depthNum = Int(currentID.dropFirst()) ?? 0
             let nextID = "d\(depthNum + 1)"
@@ -678,8 +369,7 @@ struct ContentsParsingTests {
               }
             }
             """
-            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (resp, Data(json.utf8))
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(json.utf8))
         }
         do {
             _ = try await api.resolveFiles(contentID: "d0", plainPassword: nil, accountToken: "tok")
@@ -689,7 +379,7 @@ struct ContentsParsingTests {
         }
 
         // Root folder named .gofile-partial is renamed out of staging namespace
-        MockURLProtocol.handler = { request in
+        mock.update { request in
             let json = """
             {
               "status": "ok",
@@ -703,75 +393,10 @@ struct ContentsParsingTests {
               }
             }
             """
-            let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (resp, Data(json.utf8))
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(json.utf8))
         }
         let renamed = try await api.resolveFiles(contentID: "stg", plainPassword: nil, accountToken: "tok")
         #expect(renamed.count == 1)
-        #expect(renamed[0].relativeDirectory.first != GoFileConfig.partialStagingDirectoryName)
         #expect(renamed[0].relativeDirectory.first == "\(GoFileConfig.partialStagingDirectoryName) (1)")
-    }
-
-    @Test("Rejects existing directory at destination and restarts on Last-Modified mismatch")
-    func rejectsExistingDirectoryAndLastModifiedMismatch() async throws {
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-
-        // Existing directory at finalURL must not be skipped
-        let dirConflictFile = RemoteFile(
-            id: "dir-conflict",
-            filename: "existingDir",
-            downloadLink: "https://example.com/existingDir",
-            relativeDirectory: [],
-            expectedSize: nil
-        )
-        try FileManager.default.createDirectory(
-            at: FileDownloader.destinationURL(baseDirectory: tempDir, file: dirConflictFile),
-            withIntermediateDirectories: true
-        )
-        let downloader = FileDownloader(session: makeMockSession())
-        await #expect(throws: GoFileError.unsafePath(dirConflictFile.relativePath)) {
-            _ = try await downloader.download(file: dirConflictFile, to: tempDir, accountToken: "tok") { _ in }
-        }
-
-        // Last-Modified mismatch on HTTP 206 restarts cleanly from byte 0
-        let freshData = Data("NEW-FILE-CONTENT".utf8)
-        let lmFile = RemoteFile(
-            id: "lm-mismatch",
-            filename: "report.bin",
-            downloadLink: "https://example.com/report.bin",
-            relativeDirectory: [],
-            expectedSize: Int64(freshData.count)
-        )
-        let lmPart = FileDownloader.partURL(for: lmFile, in: tempDir)
-        let lmMeta = FileDownloader.resumeMetaURL(for: lmPart)
-        try FileManager.default.createDirectory(at: lmPart.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("OLD-".utf8).write(to: lmPart)
-        try Data(#"{"etag":null,"lastModified":"Mon, 01 Jan 2024 00:00:00 GMT","expectedSize":16}"#.utf8).write(to: lmMeta)
-
-        let calls = OSAllocatedUnfairLock<Int>(initialState: 0)
-        MockURLProtocol.handler = { request in
-            let n = calls.withLock { c in c += 1; return c }
-            if n == 1 {
-                let headers = [
-                    "Content-Length": "\(freshData.count - 4)",
-                    "Content-Range": "bytes 4-\(freshData.count - 1)/\(freshData.count)",
-                    "Last-Modified": "Tue, 02 Jan 2024 00:00:00 GMT",
-                ]
-                return (HTTPURLResponse(url: request.url!, statusCode: 206, httpVersion: nil, headerFields: headers)!, Data(freshData.dropFirst(4)))
-            }
-            let headers = [
-                "Content-Length": "\(freshData.count)",
-                "Last-Modified": "Tue, 02 Jan 2024 00:00:00 GMT",
-            ]
-            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: headers)!, freshData)
-        }
-        defer { MockURLProtocol.handler = nil }
-
-        let outcome = try await downloader.download(file: lmFile, to: tempDir, accountToken: "tok") { _ in }
-        #expect(calls.withLock { $0 } == 2)
-        #expect(outcome == .downloaded(totalBytes: Int64(freshData.count), resumed: false))
-        #expect(try Data(contentsOf: FileDownloader.destinationURL(baseDirectory: tempDir, file: lmFile)) == freshData)
     }
 }

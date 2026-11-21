@@ -312,19 +312,16 @@ public struct FileDownloader: Sendable {
             }
         }
 
-        let asyncBytes: URLSession.AsyncBytes
-        let response: URLResponse
+        let http: HTTPURLResponse
+        let stream: ChunkedURLSessionStream
         do {
-            (asyncBytes, response) = try await session.bytes(for: request)
+            (http, stream) = try await ChunkedURLSessionStream.open(session: session, request: request)
         } catch is CancellationError {
             throw CancellationError()
         } catch let urlError as URLError where urlError.code == .cancelled {
             throw CancellationError()
         }
-
-        guard let http = response as? HTTPURLResponse else {
-            throw GoFileError.networkError("Invalid response for \(file.filename).")
-        }
+        defer { stream.cancel() }
 
         let responseETag = http.value(forHTTPHeaderField: "ETag")
         let responseLastModified = http.value(forHTTPHeaderField: "Last-Modified")
@@ -340,6 +337,7 @@ public struct FileDownloader: Sendable {
 
         // Handle 416 Range Not Satisfiable: rescue complete .part if server confirms exact size, else reset once without Range.
         if http.statusCode == 416 {
+            stream.cancel()
             if allowResume && existingPartSize > 0 {
                 if !validatorMismatch,
                    let crHeader = http.value(forHTTPHeaderField: "Content-Range"),
@@ -347,7 +345,7 @@ public struct FileDownloader: Sendable {
                    total == existingPartSize,
                    file.expectedSize == nil || file.expectedSize == total {
                     do {
-                        try Self.verifyMD5IfPresent(fileURL: partURL, expectedMD5: file.md5)
+                        try await Self.verifyMD5IfPresent(fileURL: partURL, expectedMD5: file.md5)
                     } catch {
                         try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
                         throw error
@@ -398,6 +396,7 @@ public struct FileDownloader: Sendable {
             }()
 
             if !rangeValid || validatorMismatch {
+                stream.cancel()
                 if allowResume {
                     try Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
                     return try await downloadInternal(
@@ -424,7 +423,7 @@ public struct FileDownloader: Sendable {
                val >= 0 {
                 return val
             }
-            return response.expectedContentLength >= 0 ? response.expectedContentLength : nil
+            return http.expectedContentLength >= 0 ? http.expectedContentLength : nil
         }()
 
         let startingOffset: Int64 = isPartial ? existingPartSize : 0
@@ -452,35 +451,8 @@ public struct FileDownloader: Sendable {
             )
         }
 
-        let handle: FileHandle = try Self.stagingLock.withLock {
-            let localFM = FileManager.default
-            if let existingAttrs = try? localFM.attributesOfItem(atPath: stagingDir.path),
-               (existingAttrs[.type] as? FileAttributeType) != .typeDirectory {
-                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
-            }
-            try localFM.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-            guard let canonicalStaging = Self.resolveRealPath(stagingDir) else {
-                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
-            }
-            let stagingCheckPath = canonicalStaging.path.hasSuffix("/") ? canonicalStaging.path : canonicalStaging.path + "/"
-            guard stagingCheckPath.hasPrefix(basePrefix) else {
-                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
-            }
-            if let partAttrs = try? localFM.attributesOfItem(atPath: partURL.path),
-               (partAttrs[.type] as? FileAttributeType) != .typeRegular {
-                throw GoFileError.unsafePath(file.relativePath)
-            }
-            if !isPartial || !localFM.fileExists(atPath: partURL.path) {
-                localFM.createFile(atPath: partURL.path, contents: nil)
-            }
-            return try FileHandle(forWritingTo: partURL)
-        }
-        defer { try? handle.close() }
-        if isPartial {
-            try handle.seekToEnd()
-        } else {
-            try handle.truncate(atOffset: 0)
-        }
+        let writer = try await DiskFileWriter.open(at: partURL, append: isPartial)
+        defer { writer.closeQuietly() }
 
         Self.saveResumeMetadata(
             ResumeMetadata(etag: responseETag, lastModified: responseLastModified, expectedSize: totalExpected),
@@ -491,7 +463,11 @@ public struct FileDownloader: Sendable {
         var buffer = Data()
         buffer.reserveCapacity(flushSize)
 
+        let expectedMD5 = Self.normalizedMD5(file.md5)
+        var incrementalHasher: Insecure.MD5? = (expectedMD5 != nil && startingOffset == 0) ? Insecure.MD5() : nil
+
         var totalWritten = startingOffset
+        var totalReceived = startingOffset
         var lastReportedTime = ContinuousClock.now
 
         await onProgress(
@@ -504,26 +480,30 @@ public struct FileDownloader: Sendable {
         )
 
         do {
-            for try await byte in asyncBytes {
+            while let chunk = try await stream.nextChunk() {
                 try Task.checkCancellation()
-                buffer.append(byte)
+                buffer.append(chunk)
+                totalReceived += Int64(chunk.count)
+                incrementalHasher?.update(data: chunk)
 
                 if buffer.count >= flushSize {
-                    try handle.write(contentsOf: buffer)
-                    totalWritten += Int64(buffer.count)
-                    buffer.removeAll(keepingCapacity: true)
+                    let toWrite = buffer
+                    buffer = Data()
+                    buffer.reserveCapacity(flushSize)
+                    try await writer.write(toWrite)
+                    totalWritten += Int64(toWrite.count)
+                }
 
-                    let now = ContinuousClock.now
-                    if now - lastReportedTime >= .milliseconds(80) {
-                        lastReportedTime = now
-                        await onProgress(
-                            FileDownloadProgress(
-                                bytesReceived: totalWritten,
-                                totalBytes: totalExpected,
-                                resumedFromOffset: startingOffset
-                            )
+                let now = ContinuousClock.now
+                if now - lastReportedTime >= .milliseconds(80) {
+                    lastReportedTime = now
+                    await onProgress(
+                        FileDownloadProgress(
+                            bytesReceived: totalReceived,
+                            totalBytes: totalExpected,
+                            resumedFromOffset: startingOffset
                         )
-                    }
+                    )
                 }
             }
         } catch is CancellationError {
@@ -535,13 +515,13 @@ public struct FileDownloader: Sendable {
         try Task.checkCancellation()
 
         if !buffer.isEmpty {
-            try handle.write(contentsOf: buffer)
-            totalWritten += Int64(buffer.count)
-            buffer.removeAll(keepingCapacity: false)
+            let remaining = buffer
+            buffer = Data()
+            try await writer.write(remaining)
+            totalWritten += Int64(remaining.count)
         }
 
-        try handle.synchronize()
-        try handle.close()
+        try await writer.synchronizeAndClose()
 
         // Verify exact completeness when expected length is known
         if let totalExpected, totalWritten != totalExpected {
@@ -562,11 +542,21 @@ public struct FileDownloader: Sendable {
             )
         }
 
-        do {
-            try Self.verifyMD5IfPresent(fileURL: partURL, expectedMD5: file.md5)
-        } catch {
-            try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
-            throw error
+        if let expectedMD5 {
+            do {
+                let actualMD5: String
+                if let hasher = incrementalHasher {
+                    actualMD5 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+                } else {
+                    actualMD5 = try await DiskFileWriter.md5Hex(of: partURL)
+                }
+                if actualMD5 != expectedMD5 {
+                    throw GoFileError.checksumMismatch(expected: expectedMD5, actual: actualMD5)
+                }
+            } catch {
+                try? Self.removePartArtifacts(partURL: partURL, metaURL: metaURL, baseDirectory: canonicalBase)
+                throw error
+            }
         }
 
         try Self.promotePartFile(from: partURL, to: finalURL, metaURL: metaURL, baseDirectory: canonicalBase)
@@ -582,23 +572,20 @@ public struct FileDownloader: Sendable {
         return .downloaded(totalBytes: totalWritten, resumed: startingOffset > 0)
     }
 
-    private static func verifyMD5IfPresent(fileURL: URL, expectedMD5: String?) throws {
+    private static func normalizedMD5(_ expectedMD5: String?) -> String? {
         guard let raw = expectedMD5?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               raw.count == 32,
               raw.allSatisfy(\.isHexDigit) else {
-            return
+            return nil
         }
-        let readHandle = try FileHandle(forReadingFrom: fileURL)
-        defer { try? readHandle.close() }
-        var hasher = Insecure.MD5()
-        while true {
-            let chunk = try readHandle.read(upToCount: 256 * 1024) ?? Data()
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
-        }
-        let actual = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-        if actual != raw {
-            throw GoFileError.checksumMismatch(expected: raw, actual: actual)
+        return raw
+    }
+
+    private static func verifyMD5IfPresent(fileURL: URL, expectedMD5: String?) async throws {
+        guard let expected = normalizedMD5(expectedMD5) else { return }
+        let actual = try await DiskFileWriter.md5Hex(of: fileURL)
+        if actual != expected {
+            throw GoFileError.checksumMismatch(expected: expected, actual: actual)
         }
     }
 
