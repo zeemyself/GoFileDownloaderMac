@@ -25,14 +25,14 @@ struct GoFileAPITests {
         #expect(GoFileAPI.contentID(from: "") == nil)
     }
 
-    @Test("Website token matches Python sha256 implementation")
-    func websiteTokenMatchesPython() {
+    @Test("Website token produces deterministic SHA-256 digest")
+    func websiteTokenDigest() {
         let token = GoFileAPI.websiteToken(accountToken: "test_token_123", timestamp: 1_700_000_000)
         #expect(token == "7fdb77995702a1e3486350c612c6fb7af1bdeea503565fd9793df57c9bef0043")
     }
 
-    @Test("Password SHA-256 matches Python hashlib.sha256")
-    func passwordHashMatchesPython() {
+    @Test("Password SHA-256 produces expected hex digest")
+    func passwordHashDigest() {
         let hash = GoFileAPI.sha256Hex("TestPassword")
         #expect(hash == "7bcf9d89298f1bfae16fa02ed6b61908fd2fa8de45dd8e2153a3c47300765328")
     }
@@ -94,7 +94,7 @@ struct GoFileAPITests {
         #expect(sanitized.hasSuffix(".mp4"))
     }
 
-    @Test("Adaptive chunk size thresholds match config.py")
+    @Test("Adaptive chunk size scales across file size thresholds")
     func chunkThresholds() {
         #expect(GoFileConfig.chunkSize(for: -1) == 512 * 1024)
         #expect(GoFileConfig.chunkSize(for: 500 * 1024) == 8 * 1024)

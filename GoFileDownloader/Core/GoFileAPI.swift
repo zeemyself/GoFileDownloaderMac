@@ -116,7 +116,7 @@ public actor GoFileAPI {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Generates the dynamic `X-Website-Token` matching Python's `generate_website_token`.
+    /// Generates the time-windowed SHA-256 `X-Website-Token` header value.
     public static func websiteToken(accountToken: String, timestamp: Int64? = nil) -> String {
         let unixSeconds = timestamp ?? Int64(Date().timeIntervalSince1970)
         let timeWindow = unixSeconds / GoFileConfig.tokenWindowSeconds
@@ -193,7 +193,7 @@ public actor GoFileAPI {
         return cleaned
     }
 
-    /// Builds request headers matching `Downloader._prepare_headers`.
+    /// Builds HTTP request headers for GoFile API calls or direct file downloads.
     public static func headers(
         accountToken: String,
         url: String? = nil,
@@ -262,7 +262,7 @@ public actor GoFileAPI {
     }
 
     /// Recursively resolves all files inside a GoFile content ID, preserving folder hierarchy
-    /// and deduplicating filenames within each folder (matching `Downloader.initialize_download`).
+    /// and deduplicating filenames within each folder.
     public func resolveFiles(
         contentID: String,
         plainPassword: String?,
