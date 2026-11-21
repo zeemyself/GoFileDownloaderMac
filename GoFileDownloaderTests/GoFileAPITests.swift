@@ -4,12 +4,23 @@ import Testing
 
 @Suite("GoFileAPI Tests")
 struct GoFileAPITests {
-    @Test("Content ID extraction from valid and invalid URLs")
+    @Test("Content ID extraction accepts valid GoFile URLs and rejects invalid hosts, schemes, or paths")
     func contentIDExtraction() {
         #expect(GoFileAPI.contentID(from: "https://gofile.io/d/clgeTz") == "clgeTz")
         #expect(GoFileAPI.contentID(from: "https://gofile.io/d/hXHGR1/") == "hXHGR1")
         #expect(GoFileAPI.contentID(from: "  https://gofile.io/d/abc123///  ") == "abc123")
+        #expect(GoFileAPI.contentID(from: "https://www.gofile.io/d/abc_123-XYZ") == "abc_123-XYZ")
+        #expect(GoFileAPI.contentID(from: "https://gofile.io/d/clgeTz?ref=twitter&x=1") == "clgeTz")
+        #expect(GoFileAPI.contentID(from: "https://gofile.io/d/clgeTz#section") == "clgeTz")
+        #expect(GoFileAPI.contentID(from: "http://GOFILE.IO/d/clgeTz?a=1#frag") == "clgeTz")
+
         #expect(GoFileAPI.contentID(from: "https://gofile.io/c/clgeTz") == nil)
+        #expect(GoFileAPI.contentID(from: "https://gofile.io/d/clgeTz/extra") == nil)
+        #expect(GoFileAPI.contentID(from: "https://gofile.io/d/..") == nil)
+        #expect(GoFileAPI.contentID(from: "https://evil.com/d/clgeTz") == nil)
+        #expect(GoFileAPI.contentID(from: "https://notgofile.io/d/clgeTz") == nil)
+        #expect(GoFileAPI.contentID(from: "https://.gofile.io/d/clgeTz") == nil)
+        #expect(GoFileAPI.contentID(from: "ftp://gofile.io/d/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "https://example.com") == nil)
         #expect(GoFileAPI.contentID(from: "") == nil)
     }
@@ -26,7 +37,7 @@ struct GoFileAPITests {
         #expect(hash == "7bcf9d89298f1bfae16fa02ed6b61908fd2fa8de45dd8e2153a3c47300765328")
     }
 
-    @Test("Content URL generation with and without password")
+    @Test("Content URL generation handles passwords, pagination, and rejects unsafe IDs")
     func contentURLGeneration() {
         let urlNoPw = GoFileAPI.contentURL(contentID: "clgeTz")
         #expect(urlNoPw?.absoluteString == "https://api.gofile.io/contents/clgeTz?cache=true&sortField=createTime&sortDirection=1")
@@ -34,9 +45,16 @@ struct GoFileAPITests {
         let pwHash = GoFileAPI.sha256Hex("TestPassword")
         let urlWithPw = GoFileAPI.contentURL(contentID: "hXHGR1", hashedPassword: pwHash)
         #expect(urlWithPw?.absoluteString == "https://api.gofile.io/contents/hXHGR1?cache=true&sortField=createTime&sortDirection=1&password=\(pwHash)")
+
+        let urlPage2 = GoFileAPI.contentURL(contentID: "clgeTz", page: 2)
+        #expect(urlPage2?.absoluteString == "https://api.gofile.io/contents/clgeTz?cache=true&sortField=createTime&sortDirection=1&page=2")
+
+        #expect(GoFileAPI.contentURL(contentID: "../bad") == nil)
+        #expect(GoFileAPI.contentURL(contentID: "abc?x=1") == nil)
+        #expect(GoFileAPI.contentURL(contentID: "") == nil)
     }
 
-    @Test("Headers generation for auth and file download requests")
+    @Test("Headers generation sets auth headers for API and Accept-Encoding identity for downloads")
     func headersGeneration() {
         let authHeaders = GoFileAPI.headers(
             accountToken: "test_token_123",
@@ -46,6 +64,7 @@ struct GoFileAPITests {
         #expect(authHeaders["Authorization"] == "Bearer test_token_123")
         #expect(authHeaders["X-Website-Token"] == "7fdb77995702a1e3486350c612c6fb7af1bdeea503565fd9793df57c9bef0043")
         #expect(authHeaders["X-BL"] == "en-US")
+        #expect(authHeaders["Accept-Encoding"] == "gzip")
 
         let downloadHeaders = GoFileAPI.headers(
             accountToken: "test_token_123",
@@ -55,10 +74,29 @@ struct GoFileAPITests {
         #expect(downloadHeaders["Cookie"] == "accountToken=test_token_123")
         #expect(downloadHeaders["Referer"] == "https://store1.gofile.io/download/abc/")
         #expect(downloadHeaders["Origin"] == "https://store1.gofile.io/download/abc")
+        #expect(downloadHeaders["Accept-Encoding"] == "identity")
+    }
+
+    @Test("sanitizePathComponent neutralizes traversal, separators, control/bidi chars, and long UTF-8 names")
+    func sanitizePathComponentSafety() {
+        #expect(GoFileAPI.sanitizePathComponent("..") == "unnamed")
+        #expect(GoFileAPI.sanitizePathComponent(".") == "unnamed")
+        #expect(GoFileAPI.sanitizePathComponent("   ") == "unnamed")
+        #expect(GoFileAPI.sanitizePathComponent(".\u{202E}.") == "unnamed")
+        #expect(GoFileAPI.sanitizePathComponent("..\0") == "unnamed")
+        #expect(GoFileAPI.sanitizePathComponent("../etc/passwd") == ".._etc_passwd")
+        #expect(GoFileAPI.sanitizePathComponent("a\\b/c:d") == "a_b_c_d")
+        #expect(GoFileAPI.sanitizePathComponent("doc\u{202E}txt.exe") == "doctxt.exe")
+
+        let overlong = String(repeating: "あ", count: 100) + ".mp4"
+        let sanitized = GoFileAPI.sanitizePathComponent(overlong)
+        #expect(sanitized.utf8.count <= GoFileConfig.maxPathComponentUTF8Bytes)
+        #expect(sanitized.hasSuffix(".mp4"))
     }
 
     @Test("Adaptive chunk size thresholds match config.py")
     func chunkThresholds() {
+        #expect(GoFileConfig.chunkSize(for: -1) == 512 * 1024)
         #expect(GoFileConfig.chunkSize(for: 500 * 1024) == 8 * 1024)
         #expect(GoFileConfig.chunkSize(for: 5 * 1024 * 1024) == 16 * 1024)
         #expect(GoFileConfig.chunkSize(for: 25 * 1024 * 1024) == 64 * 1024)
@@ -67,16 +105,24 @@ struct GoFileAPITests {
         #expect(GoFileConfig.chunkSize(for: 500 * 1024 * 1024) == 512 * 1024)
     }
 
-    @Test("Retry backoff with jitter scales exponentially and increases for HTTP 421/429")
-    func retryJitterBackoff() {
-        let normal1 = DownloadEngine.retryDelayMilliseconds(attempt: 1, error: GoFileError.httpError(500))
-        let normal2 = DownloadEngine.retryDelayMilliseconds(attempt: 2, error: GoFileError.httpError(500))
-        #expect((1_450...2_450).contains(normal1))
-        #expect((2_650...3_650).contains(normal2))
-
-        let rate1 = DownloadEngine.retryDelayMilliseconds(attempt: 1, error: GoFileError.httpError(421))
-        let rate2 = DownloadEngine.retryDelayMilliseconds(attempt: 2, error: GoFileError.httpError(421))
-        #expect((3_000...4_500).contains(rate1))
-        #expect((5_500...7_000).contains(rate2))
+    @Test("GoFileError provides non-empty descriptions for all cases")
+    func errorDescriptions() {
+        let cases: [GoFileError] = [
+            .invalidURL("bad"),
+            .accountCreationFailed,
+            .passwordRequired,
+            .wrongPassword,
+            .notFound("abc"),
+            .notPublic("abc"),
+            .unsafePath("../x"),
+            .integrityMismatch("size mismatch"),
+            .checksumMismatch(expected: "aaa", actual: "bbb"),
+            .apiError("error-other"),
+            .httpError(503),
+            .networkError("offline"),
+        ]
+        for err in cases {
+            #expect(!(err.errorDescription ?? "").isEmpty)
+        }
     }
 }

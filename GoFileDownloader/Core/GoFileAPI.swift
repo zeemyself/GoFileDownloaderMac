@@ -83,16 +83,31 @@ public actor GoFileAPI {
 
     // MARK: - Pure helpers
 
-    /// Extracts the content ID from a GoFile URL (`.../d/<id>`).
+    /// Extracts the content ID from a valid GoFile URL (`https://[*.]gofile.io/d/<id>`).
     public static func contentID(from url: String) -> String? {
         let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
-        let parts = trimmed.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-        guard parts.count >= 2, parts[parts.count - 2] == "d" else {
+        guard let components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = components.host?.lowercased(),
+              host == "gofile.io" || (!host.hasPrefix(".") && host.hasSuffix(".gofile.io")) else {
             return nil
         }
-        let id = parts[parts.count - 1]
-        return id.isEmpty ? nil : id
+        let pathSegments = components.path
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+        guard pathSegments.count == 2, pathSegments[0] == "d" else {
+            return nil
+        }
+        let id = pathSegments[1]
+        guard Self.isValidContentID(id) else {
+            return nil
+        }
+        return id
+    }
+
+    private static func isValidContentID(_ id: String) -> Bool {
+        !id.isEmpty && id.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-") }
     }
 
     /// SHA-256 hex digest of a plain password string.
@@ -111,17 +126,23 @@ public actor GoFileAPI {
 
     /// Builds the `/contents/<id>` URL with optional already-hashed password.
     public static func contentURL(contentID: String, hashedPassword: String? = nil, page: Int = 1) -> URL? {
-        var urlString = "\(GoFileConfig.apiBase)/contents/\(contentID)?cache=true&sortField=createTime&sortDirection=1"
+        guard Self.isValidContentID(contentID),
+              var components = URLComponents(string: "\(GoFileConfig.apiBase)/contents/\(contentID)") else {
+            return nil
+        }
+        var queryItems = [
+            URLQueryItem(name: "cache", value: "true"),
+            URLQueryItem(name: "sortField", value: "createTime"),
+            URLQueryItem(name: "sortDirection", value: "1"),
+        ]
         if page > 1 {
-            urlString += "&page=\(page)"
+            queryItems.append(URLQueryItem(name: "page", value: String(page)))
         }
         if let hashedPassword, !hashedPassword.isEmpty {
-            var allowed = CharacterSet.urlQueryAllowed
-            allowed.remove(charactersIn: "&+=?")
-            let encoded = hashedPassword.addingPercentEncoding(withAllowedCharacters: allowed) ?? hashedPassword
-            urlString += "&password=\(encoded)"
+            queryItems.append(URLQueryItem(name: "password", value: hashedPassword))
         }
-        return URL(string: urlString)
+        components.queryItems = queryItems
+        return components.url
     }
 
     /// Strips query strings, fragments, and credentials from URLs before surfacing in errors or logs.
@@ -522,7 +543,7 @@ private struct ContentNode: Decodable {
     let children: [String: ContentNode]?
 
     var requiresPassword: Bool {
-        password != nil
+        password == true
     }
 
     enum CodingKeys: String, CodingKey {
@@ -541,12 +562,17 @@ private struct ContentNode: Decodable {
         passwordStatus = try container.decodeIfPresent(String.self, forKey: .passwordStatus)
         children = try container.decodeIfPresent([String: ContentNode].self, forKey: .children)
 
-        // GoFile may return `password: true` or a string/int when password-protected
+        // GoFile may return `password: true/false` or a string/int when password-protected
         if container.contains(.password) {
             if let boolVal = try? container.decode(Bool.self, forKey: .password) {
                 password = boolVal
             } else if (try? container.decodeNil(forKey: .password)) == true {
                 password = nil
+            } else if let intVal = try? container.decode(Int.self, forKey: .password) {
+                password = intVal != 0
+            } else if let strVal = try? container.decode(String.self, forKey: .password) {
+                let trimmed = strVal.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                password = !trimmed.isEmpty && trimmed != "false" && trimmed != "0"
             } else {
                 password = true
             }

@@ -523,6 +523,15 @@ public final class DownloadStore {
         logs.removeAll()
     }
 
+    public func dismissFeedback() {
+        guard !state.isActive else { return }
+        needsPasswordPrompt = false
+        if items.isEmpty {
+            state = .idle
+            contentID = nil
+        }
+    }
+
     public func startDownload() {
         guard !state.isActive else { return }
         let trimmedURL = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)

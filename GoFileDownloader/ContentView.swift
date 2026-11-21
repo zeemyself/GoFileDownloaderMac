@@ -6,6 +6,7 @@ struct ContentView: View {
     @FocusState private var focusedField: Field?
     @State private var showLogPanel: Bool = false
     @State private var selectedItemIDs = Set<DownloadItem.ID>()
+    @State private var bannerDismissed: Bool = false
 
     private enum Field: Hashable {
         case url
@@ -20,7 +21,15 @@ struct ContentView: View {
 
             Divider()
 
-            if !store.items.isEmpty || store.state.isActive {
+            if !bannerDismissed, let banner = feedbackBannerState {
+                feedbackBanner(banner)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(banner.tint.opacity(0.10))
+                Divider()
+            }
+
+            if !store.items.isEmpty || store.state == .resolving {
                 overallSummaryBar
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
@@ -55,6 +64,10 @@ struct ContentView: View {
         }
         .onChange(of: store.sessionID) { _, _ in
             selectedItemIDs.removeAll()
+            bannerDismissed = false
+        }
+        .onChange(of: store.state) { _, _ in
+            bannerDismissed = false
         }
     }
 
@@ -284,6 +297,90 @@ struct ContentView: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.red)
                 .lineLimit(1)
+                .help(msg)
+        }
+    }
+
+    private struct FeedbackBannerModel {
+        let icon: String
+        let title: String
+        let message: String
+        let tint: Color
+    }
+
+    private var feedbackBannerState: FeedbackBannerModel? {
+        if store.needsPasswordPrompt {
+            let message: String
+            if case .failed(let msg) = store.state {
+                message = msg
+            } else {
+                message = "This album requires a password. Enter it above and click Download."
+            }
+            return FeedbackBannerModel(
+                icon: "lock.trianglebadge.exclamationmark.fill",
+                title: "Password Required",
+                message: message,
+                tint: .orange
+            )
+        }
+        if case .failed(let msg) = store.state {
+            return FeedbackBannerModel(
+                icon: "exclamationmark.triangle.fill",
+                title: store.items.isEmpty ? "Unable to Load Album" : "Download Finished with Errors",
+                message: msg,
+                tint: .red
+            )
+        }
+        if store.state == .finished && store.items.isEmpty {
+            return FeedbackBannerModel(
+                icon: "info.circle.fill",
+                title: "Empty Album",
+                message: "No downloadable files were found in this GoFile link.",
+                tint: .secondary
+            )
+        }
+        return nil
+    }
+
+    private func feedbackBanner(_ banner: FeedbackBannerModel) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: banner.icon)
+                .foregroundStyle(banner.tint)
+                .font(.title3)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(banner.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(banner.tint == .secondary ? .primary : banner.tint)
+                Text(banner.message)
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 8) {
+                if !showLogPanel {
+                    Button("Show Log") {
+                        showLogPanel = true
+                    }
+                    .controlSize(.small)
+                }
+
+                if !store.state.isActive {
+                    Button("Dismiss") {
+                        if store.items.isEmpty {
+                            store.dismissFeedback()
+                        } else {
+                            bannerDismissed = true
+                        }
+                    }
+                    .controlSize(.small)
+                }
+            }
         }
     }
 
@@ -299,14 +396,59 @@ struct ContentView: View {
     // MARK: - Files Table
 
     @ViewBuilder
-    private var filesTableSection: some View {
-        if store.items.isEmpty {
+    private var emptyStateView: some View {
+        switch store.state {
+        case .resolving:
+            ContentUnavailableView {
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.regular)
+                    Text("Fetching Album Contents…")
+                }
+            } description: {
+                Text("Connecting to GoFile and resolving files in this album.")
+            }
+        case .failed(let msg):
+            ContentUnavailableView {
+                Label(
+                    store.needsPasswordPrompt ? "Password Required" : "Could Not Load Album",
+                    systemImage: store.needsPasswordPrompt ? "lock.fill" : "exclamationmark.triangle"
+                )
+            } description: {
+                Text(msg)
+            } actions: {
+                if !showLogPanel {
+                    Button("Show Event Log") {
+                        showLogPanel = true
+                    }
+                }
+            }
+        case .cancelled:
+            ContentUnavailableView {
+                Label("Download Cancelled", systemImage: "pause.circle")
+            } description: {
+                Text("Enter a GoFile album link above or click Download to try again.")
+            }
+        case .finished:
+            ContentUnavailableView {
+                Label("Album Is Empty", systemImage: "tray")
+            } description: {
+                Text("No downloadable files were found in this GoFile link.")
+            }
+        case .idle, .downloading:
             ContentUnavailableView {
                 Label("No Active Downloads", systemImage: "arrow.down.doc")
             } description: {
                 Text("Enter a GoFile album link (e.g. https://gofile.io/d/xxxxxx) above and click Download.")
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var filesTableSection: some View {
+        if store.items.isEmpty {
+            emptyStateView
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             Table(store.items, selection: $selectedItemIDs) {
                 TableColumn("File") { item in
