@@ -90,7 +90,7 @@ public actor GoFileAPI {
               let scheme = components.scheme?.lowercased(),
               scheme == "https" || scheme == "http",
               let host = components.host?.lowercased(),
-              host == "gofile.io" || host.hasSuffix(".gofile.io") else {
+              host == "gofile.io" || (!host.hasPrefix(".") && host.hasSuffix(".gofile.io")) else {
             return nil
         }
         let pathSegments = components.path

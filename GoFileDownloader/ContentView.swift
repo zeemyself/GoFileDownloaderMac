@@ -6,6 +6,7 @@ struct ContentView: View {
     @FocusState private var focusedField: Field?
     @State private var showLogPanel: Bool = false
     @State private var selectedItemIDs = Set<DownloadItem.ID>()
+    @State private var bannerDismissed: Bool = false
 
     private enum Field: Hashable {
         case url
@@ -20,7 +21,7 @@ struct ContentView: View {
 
             Divider()
 
-            if let banner = feedbackBannerState {
+            if !bannerDismissed, let banner = feedbackBannerState {
                 feedbackBanner(banner)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
@@ -28,7 +29,7 @@ struct ContentView: View {
                 Divider()
             }
 
-            if !store.items.isEmpty || store.state != .idle {
+            if !store.items.isEmpty || store.state == .resolving {
                 overallSummaryBar
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
@@ -63,6 +64,10 @@ struct ContentView: View {
         }
         .onChange(of: store.sessionID) { _, _ in
             selectedItemIDs.removeAll()
+            bannerDismissed = false
+        }
+        .onChange(of: store.state) { _, _ in
+            bannerDismissed = false
         }
     }
 
@@ -365,9 +370,13 @@ struct ContentView: View {
                     .controlSize(.small)
                 }
 
-                if store.items.isEmpty && !store.state.isActive {
+                if !store.state.isActive {
                     Button("Dismiss") {
-                        store.dismissFeedback()
+                        if store.items.isEmpty {
+                            store.dismissFeedback()
+                        } else {
+                            bannerDismissed = true
+                        }
                     }
                     .controlSize(.small)
                 }

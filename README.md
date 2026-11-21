@@ -8,7 +8,7 @@ A native macOS app written in Swift 6 and SwiftUI for downloading files and fold
 - **Automatic Filename Deduplication** — Resolves case-insensitive filename collisions within each folder by appending ` (1)`, ` (2)`, etc. before the extension.
 - **Password-Protected Links** — Supports password-protected GoFile albums (SHA-256 hashed client-side) and highlights the password field automatically when one is required.
 - **Resumable Transfers (`.part` files)** — Streams downloads to `.part` files and resumes interrupted transfers using HTTP `Range` (`206 Partial Content`) requests. Handles `416 Range Not Satisfiable` automatically and verifies completeness against `Content-Length` before moving files into place.
-- **Skip Existing Files** — Automatically skips non-empty files that already exist at the destination.
+- **Skip Existing Files** — Automatically skips files at the destination whose size matches the expected remote size (and re-downloads mismatched sizes).
 - **Concurrent Worker Pool & Smart Retries** — Downloads multiple files in parallel with configurable concurrency and retry counts, using jittered exponential backoff with longer cooldowns for HTTP `421`, `429`, and `503` responses.
 - **Native macOS UI** — Live per-file and overall progress, smoothed transfer speeds, ETA estimates, multi-select row context menu (retry/resume, re-download from scratch, reveal in Finder, open file, copy filenames/links), and a collapsible timestamped event log.
 - **Launch Arguments** — Supports pre-filling URLs, passwords, output folders, and auto-starting downloads from the command line.
@@ -97,17 +97,25 @@ GoFileDownloader/
 ├── Formatters.swift            # Byte count, transfer speed, ETA, and timestamp formatting
 ├── Assets.xcassets/            # App icon and accent color
 └── Core/
-    ├── GoFileConfig.swift      # API constants, headers, defaults, and adaptive chunk sizes
-    ├── GoFileAPI.swift         # Guest token creation, website token signing, recursive album resolution
-    ├── FilenameResolver.swift  # Case-insensitive per-folder filename deduplication
-    ├── FileDownloader.swift    # Streaming downloader with .part files and HTTP Range resume
-    └── DownloadEngine.swift    # Concurrent TaskGroup scheduler and jittered exponential backoff
+    ├── GoFileConfig.swift            # API constants, headers, defaults, and adaptive chunk sizes
+    ├── GoFileAPI.swift               # Guest token creation, website token signing, recursive album resolution
+    ├── FilenameResolver.swift        # Case-insensitive per-folder filename deduplication
+    ├── ChunkedURLSessionStream.swift # Backpressure-bounded URLSessionDataDelegate chunk stream
+    ├── DiskFileWriter.swift          # Off-pool serial disk writes, fsync, and cancellable MD5 hashing
+    ├── FileDownloader.swift          # Streaming downloader with isolated .part staging and HTTP Range resume
+    └── DownloadEngine.swift          # Concurrent TaskGroup scheduler and jittered exponential backoff
 
 GoFileDownloaderTests/
-├── GoFileAPITests.swift        # URL parsing, token/password hashing, headers, chunk sizes, backoff
-├── FilenameResolverTests.swift # Case-insensitive filename collision tests
-├── ContentsParsingTests.swift  # Mocked folder resolution, password errors, and HTTP 206 resume tests
-└── LiveSmokeTests.swift        # Opt-in live end-to-end GoFile API smoke test
+├── Support/
+│   └── MockURLProtocol.swift         # Thread-safe per-session URLProtocol mock
+├── GoFileAPITests.swift              # URL parsing, token/password hashing, headers, chunk sizes
+├── FilenameResolverTests.swift       # Case-insensitive filename collision & UTF-8 bound tests
+├── ContentsParsingTests.swift        # Mocked folder resolution, password states, pagination & depth guards
+├── FileDownloaderTests.swift         # Streaming, backpressure, resume, 416, MD5, symlink & staging tests
+├── DownloadEngineTests.swift         # Concurrency limits, retries, backoff, and cancellation tests
+├── DownloadStoreTests.swift          # Session lifecycle, errors, retry deadlock, and metrics tests
+├── FormattersTests.swift             # Byte count, speed, ETA, and timestamp formatting tests
+└── LiveSmokeTests.swift              # Opt-in live end-to-end GoFile API smoke test
 ```
 
 ## Testing

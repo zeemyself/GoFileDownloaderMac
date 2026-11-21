@@ -4,8 +4,11 @@ import os
 /// Backpressure-bounded chunked streaming adapter over `URLSessionDataTask` (`URLSessionTask.delegate`).
 /// Delivers full network `Data` chunks instead of iterating byte-by-byte via `URLSession.AsyncBytes`.
 internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private static let highWaterMark = 2 * 1024 * 1024 // 2 MB
-    private static let lowWaterMark = 512 * 1024       // 512 KB
+    internal static let defaultHighWaterMark = 2 * 1024 * 1024 // 2 MB
+    internal static let defaultLowWaterMark = 512 * 1024       // 512 KB
+
+    private let highWaterMark: Int
+    private let lowWaterMark: Int
 
     private struct State {
         var task: URLSessionDataTask?
@@ -15,7 +18,9 @@ internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, 
         var chunks: [Data] = []
         var headIndex = 0
         var bufferedBytes = 0
-        var isTaskSuspended = false
+        var desiredSuspended = false
+        var appliedSuspended = false
+        var isUpdatingTaskSuspension = false
 
         var consumerContinuation: CheckedContinuation<Data?, Error>?
         var finished = false
@@ -25,12 +30,23 @@ internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, 
 
     private let state = OSAllocatedUnfairLock<State>(initialState: State())
 
+    internal init(
+        highWaterMark: Int = ChunkedURLSessionStream.defaultHighWaterMark,
+        lowWaterMark: Int = ChunkedURLSessionStream.defaultLowWaterMark
+    ) {
+        self.highWaterMark = max(1, highWaterMark)
+        self.lowWaterMark = max(0, min(lowWaterMark, self.highWaterMark - 1))
+        super.init()
+    }
+
     static func open(
         session: URLSession,
-        request: URLRequest
+        request: URLRequest,
+        highWaterMark: Int = ChunkedURLSessionStream.defaultHighWaterMark,
+        lowWaterMark: Int = ChunkedURLSessionStream.defaultLowWaterMark
     ) async throws -> (HTTPURLResponse, ChunkedURLSessionStream) {
         try Task.checkCancellation()
-        let bridge = ChunkedURLSessionStream()
+        let bridge = ChunkedURLSessionStream(highWaterMark: highWaterMark, lowWaterMark: lowWaterMark)
         let task = session.dataTask(with: request)
         task.delegate = bridge
         bridge.state.withLock { $0.task = task }
@@ -61,9 +77,9 @@ internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, 
         try Task.checkCancellation()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data?, Error>) in
-                let action: (result: Result<Data?, Error>?, taskToResume: URLSessionDataTask?) = state.withLock { s in
+                let action: (result: Result<Data?, Error>?, shouldReconcile: Bool) = state.withLock { s in
                     if s.cancelled {
-                        return (.failure(CancellationError()), nil)
+                        return (.failure(CancellationError()), false)
                     }
                     if s.headIndex < s.chunks.count {
                         let chunk = s.chunks[s.headIndex]
@@ -74,24 +90,26 @@ internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, 
                             s.headIndex = 0
                         }
                         s.bufferedBytes -= chunk.count
-                        var taskToResume: URLSessionDataTask?
-                        if s.isTaskSuspended && s.bufferedBytes <= Self.lowWaterMark && !s.finished {
-                            s.isTaskSuspended = false
-                            taskToResume = s.task
+                        var shouldReconcile = false
+                        if s.desiredSuspended && s.bufferedBytes <= self.lowWaterMark && !s.finished {
+                            s.desiredSuspended = false
+                            shouldReconcile = true
                         }
-                        return (.success(chunk), taskToResume)
+                        return (.success(chunk), shouldReconcile)
                     }
                     if s.finished {
                         if let err = s.terminalError {
-                            return (.failure(err), nil)
+                            return (.failure(err), false)
                         }
-                        return (.success(nil), nil)
+                        return (.success(nil), false)
                     }
                     s.consumerContinuation = continuation
-                    return (nil, nil)
+                    return (nil, false)
                 }
 
-                action.taskToResume?.resume()
+                if action.shouldReconcile {
+                    self.reconcileTaskSuspension()
+                }
                 if let result = action.result {
                     continuation.resume(with: result)
                 }
@@ -110,6 +128,7 @@ internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, 
             guard !s.cancelled else { return (nil, nil, nil) }
             s.cancelled = true
             s.finished = true
+            s.desiredSuspended = false
             s.chunks.removeAll(keepingCapacity: false)
             s.headIndex = 0
             s.bufferedBytes = 0
@@ -125,6 +144,45 @@ internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, 
         action.task?.cancel()
         action.respCont?.resume(throwing: CancellationError())
         action.consCont?.resume(throwing: CancellationError())
+    }
+
+    /// Serializes `URLSessionTask.suspend()` and `resume()` calls without holding `state` lock across
+    /// external `URLSessionTask` methods, ensuring a low-water resume can never overtake a high-water suspend.
+    private func reconcileTaskSuspension() {
+        var holdsControl = false
+        while true {
+            let alreadyHolding = holdsControl
+            let step: (task: URLSessionDataTask, suspend: Bool)? = state.withLock { s in
+                if !alreadyHolding {
+                    guard !s.isUpdatingTaskSuspension else { return nil }
+                    guard !s.cancelled, !s.finished, let task = s.task,
+                          s.desiredSuspended != s.appliedSuspended else {
+                        return nil
+                    }
+                    s.isUpdatingTaskSuspension = true
+                    let target = s.desiredSuspended
+                    s.appliedSuspended = target
+                    return (task, target)
+                } else {
+                    guard !s.cancelled, !s.finished, let task = s.task,
+                          s.desiredSuspended != s.appliedSuspended else {
+                        s.isUpdatingTaskSuspension = false
+                        return nil
+                    }
+                    let target = s.desiredSuspended
+                    s.appliedSuspended = target
+                    return (task, target)
+                }
+            }
+
+            guard let step else { return }
+            holdsControl = true
+            if step.suspend {
+                step.task.suspend()
+            } else {
+                step.task.resume()
+            }
+        }
     }
 
     // MARK: - URLSessionDataDelegate
@@ -166,7 +224,7 @@ internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, 
         guard !data.isEmpty else { return }
         let action: (
             consCont: CheckedContinuation<Data?, Error>?,
-            shouldSuspend: Bool
+            shouldReconcile: Bool
         ) = state.withLock { s in
             guard !s.cancelled, !s.finished else { return (nil, false) }
             if let continuation = s.consumerContinuation {
@@ -175,15 +233,15 @@ internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, 
             }
             s.chunks.append(data)
             s.bufferedBytes += data.count
-            if !s.isTaskSuspended && s.bufferedBytes >= Self.highWaterMark {
-                s.isTaskSuspended = true
+            if !s.desiredSuspended && s.bufferedBytes >= self.highWaterMark {
+                s.desiredSuspended = true
                 return (nil, true)
             }
             return (nil, false)
         }
 
-        if action.shouldSuspend {
-            dataTask.suspend()
+        if action.shouldReconcile {
+            reconcileTaskSuspension()
         }
         action.consCont?.resume(returning: data)
     }
@@ -203,6 +261,7 @@ internal final class ChunkedURLSessionStream: NSObject, URLSessionDataDelegate, 
             finalError: Error?
         ) = state.withLock { s in
             s.finished = true
+            s.desiredSuspended = false
             s.task = nil
             let effectiveError: Error? = s.cancelled ? CancellationError() : initialError
             if let effectiveError, s.terminalError == nil {

@@ -16,6 +16,7 @@ struct FormattersTests {
         #expect(Formatters.speed(0) == "—")
         #expect(Formatters.speed(0.5) == "—")
         #expect(Formatters.speed(.nan) == "—")
+        #expect(Formatters.speed(.infinity) == "—")
         #expect(Formatters.speed(2_000_000).hasSuffix("/s"))
     }
 
@@ -24,6 +25,7 @@ struct FormattersTests {
         #expect(Formatters.eta(remainingBytes: 0, bytesPerSecond: 1000) == "—")
         #expect(Formatters.eta(remainingBytes: 1000, bytesPerSecond: 0) == "—")
         #expect(Formatters.eta(remainingBytes: 1000, bytesPerSecond: .nan) == "—")
+        #expect(Formatters.eta(remainingBytes: 1000, bytesPerSecond: .infinity) == "—")
         #expect(Formatters.eta(remainingBytes: 45_000, bytesPerSecond: 1_000) == "45s")
         #expect(Formatters.eta(remainingBytes: 125_000, bytesPerSecond: 1_000) == "2m 05s")
         #expect(Formatters.eta(remainingBytes: 7_380_000, bytesPerSecond: 1_000) == "2h 03m")

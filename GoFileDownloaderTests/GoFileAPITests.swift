@@ -19,6 +19,7 @@ struct GoFileAPITests {
         #expect(GoFileAPI.contentID(from: "https://gofile.io/d/..") == nil)
         #expect(GoFileAPI.contentID(from: "https://evil.com/d/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "https://notgofile.io/d/clgeTz") == nil)
+        #expect(GoFileAPI.contentID(from: "https://.gofile.io/d/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "ftp://gofile.io/d/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "https://example.com") == nil)
         #expect(GoFileAPI.contentID(from: "") == nil)

@@ -6,13 +6,13 @@ public enum Formatters {
     }
 
     public static func speed(_ bytesPerSecond: Double) -> String {
-        guard bytesPerSecond > 1 else { return "—" }
+        guard bytesPerSecond.isFinite, bytesPerSecond > 1 else { return "—" }
         let formatted = ByteCountFormatter.string(fromByteCount: Int64(bytesPerSecond), countStyle: .file)
         return "\(formatted)/s"
     }
 
     public static func eta(remainingBytes: Int64, bytesPerSecond: Double) -> String {
-        guard remainingBytes > 0, bytesPerSecond > 1 else { return "—" }
+        guard remainingBytes > 0, bytesPerSecond.isFinite, bytesPerSecond > 1 else { return "—" }
         let seconds = Int((Double(remainingBytes) / bytesPerSecond).rounded())
         guard seconds >= 0 && seconds < 86400 * 7 else { return "—" }
         if seconds < 60 {

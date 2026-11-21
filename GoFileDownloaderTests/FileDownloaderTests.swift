@@ -562,4 +562,230 @@ struct FileDownloaderTests {
         let savedPartSize = (attrs[.size] as? Int64) ?? 0
         #expect(savedPartSize >= Int64(chunk.count))
     }
+
+    @Test("Rejects existing directory, non-HTTP downloadLink, Last-Modified 206 mismatch, and 416 ETag mismatch")
+    func rejectsDirectoryConflictNonHTTPSchemeAndValidatorMismatches() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mock = MockSessionScope { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data())
+        }
+        defer { mock.invalidate() }
+        let downloader = FileDownloader(session: mock.session)
+
+        // Existing directory at destination must fail instead of skipping
+        let dirConflict = RemoteFile(
+            id: "dir-1",
+            filename: "existingDir",
+            downloadLink: "https://example.com/existingDir",
+            relativeDirectory: []
+        )
+        try FileManager.default.createDirectory(
+            at: FileDownloader.destinationURL(baseDirectory: tempDir, file: dirConflict),
+            withIntermediateDirectories: true
+        )
+        await #expect(throws: GoFileError.unsafePath(dirConflict.relativePath)) {
+            _ = try await downloader.download(file: dirConflict, to: tempDir, accountToken: "tok") { _ in }
+        }
+
+        // Non-HTTP(S) downloadLink is rejected before issuing any request
+        let fileSchemeRemote = RemoteFile(
+            id: "scheme-1",
+            filename: "secret.txt",
+            downloadLink: "file:///etc/passwd",
+            relativeDirectory: []
+        )
+        await #expect(throws: GoFileError.invalidURL("file:///etc/passwd")) {
+            _ = try await downloader.download(file: fileSchemeRemote, to: tempDir, accountToken: "tok") { _ in }
+        }
+
+        // Last-Modified mismatch on HTTP 206 restarts cleanly from byte 0
+        let freshData = Data("UPDATED-PAYLOAD-DATA".utf8)
+        let lmFile = RemoteFile(
+            id: "lm-206",
+            filename: "lm.bin",
+            downloadLink: "https://example.com/lm.bin",
+            relativeDirectory: [],
+            expectedSize: Int64(freshData.count)
+        )
+        let lmPart = FileDownloader.partURL(for: lmFile, in: tempDir)
+        let lmMeta = FileDownloader.resumeMetaURL(for: lmPart)
+        try FileManager.default.createDirectory(at: lmPart.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("STALE".utf8).write(to: lmPart)
+        try Data(#"{"etag":null,"lastModified":"Mon, 01 Jan 2024 00:00:00 GMT","expectedSize":20}"#.utf8).write(to: lmMeta)
+
+        let lmCalls = OSAllocatedUnfairLock<Int>(initialState: 0)
+        mock.update { request in
+            let n = lmCalls.withLock { c in c += 1; return c }
+            if n == 1 {
+                let headers = [
+                    "Content-Length": "\(freshData.count - 5)",
+                    "Content-Range": "bytes 5-\(freshData.count - 1)/\(freshData.count)",
+                    "Last-Modified": "Tue, 02 Jan 2024 00:00:00 GMT",
+                ]
+                return (HTTPURLResponse(url: request.url!, statusCode: 206, httpVersion: nil, headerFields: headers)!, Data(freshData.dropFirst(5)))
+            }
+            let headers = [
+                "Content-Length": "\(freshData.count)",
+                "Last-Modified": "Tue, 02 Jan 2024 00:00:00 GMT",
+            ]
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: headers)!, freshData)
+        }
+        let lmOutcome = try await downloader.download(file: lmFile, to: tempDir, accountToken: "tok") { _ in }
+        #expect(lmCalls.withLock { $0 } == 2)
+        #expect(lmOutcome == .downloaded(totalBytes: Int64(freshData.count), resumed: false))
+        #expect(try Data(contentsOf: FileDownloader.destinationURL(baseDirectory: tempDir, file: lmFile)) == freshData)
+
+        // ETag mismatch on HTTP 416 must NOT rescue stale .part of same size
+        let newSameSizeData = Data("NEW-SAME-SIZE-BYTES!".utf8)
+        let staleSameSize = Data("OLD-SAME-SIZE-BYTES!".utf8)
+        let rescueFile = RemoteFile(
+            id: "etag-416",
+            filename: "same-size.bin",
+            downloadLink: "https://example.com/same-size.bin",
+            relativeDirectory: [],
+            expectedSize: Int64(newSameSizeData.count)
+        )
+        let rescuePart = FileDownloader.partURL(for: rescueFile, in: tempDir)
+        let rescueMeta = FileDownloader.resumeMetaURL(for: rescuePart)
+        try FileManager.default.createDirectory(at: rescuePart.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try staleSameSize.write(to: rescuePart)
+        try Data(#"{"etag":"\"v1\"","lastModified":null,"expectedSize":20}"#.utf8).write(to: rescueMeta)
+
+        let calls416 = OSAllocatedUnfairLock<Int>(initialState: 0)
+        mock.update { request in
+            let n = calls416.withLock { c in c += 1; return c }
+            if n == 1 {
+                let headers = [
+                    "Content-Range": "bytes */\(newSameSizeData.count)",
+                    "ETag": "\"v2\"",
+                ]
+                return (HTTPURLResponse(url: request.url!, statusCode: 416, httpVersion: nil, headerFields: headers)!, Data())
+            }
+            let headers = [
+                "Content-Length": "\(newSameSizeData.count)",
+                "ETag": "\"v2\"",
+            ]
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: headers)!, newSameSizeData)
+        }
+        let outcome416 = try await downloader.download(file: rescueFile, to: tempDir, accountToken: "tok") { _ in }
+        #expect(calls416.withLock { $0 } == 2)
+        #expect(outcome416 == .downloaded(totalBytes: Int64(newSameSizeData.count), resumed: false))
+        #expect(try Data(contentsOf: FileDownloader.destinationURL(baseDirectory: tempDir, file: rescueFile)) == newSameSizeData)
+    }
+
+    @Test("ChunkedURLSessionStream serializes high-water suspend and low-water resume without stalling")
+    func chunkedStreamBackpressureNeverStalls() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // 1. High-contention tight-watermark stress directly on ChunkedURLSessionStream (16 KB / 4 KB)
+        let smallChunks: [Data] = (0..<128).map { idx in
+            Data(repeating: UInt8(idx & 0xFF), count: 8 * 1024)
+        }
+        let expectedSmall = smallChunks.reduce(into: Data()) { $0.append($1) }
+        let tightMock = MockSessionScope(chunkHandler: { request in
+            let resp = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Length": "\(expectedSmall.count)"]
+            )!
+            return (resp, smallChunks)
+        })
+        defer { tightMock.invalidate() }
+
+        let req = URLRequest(url: URL(string: "https://example.com/backpressure-tight")!)
+        let (_, stream) = try await ChunkedURLSessionStream.open(
+            session: tightMock.session,
+            request: req,
+            highWaterMark: 16 * 1024,
+            lowWaterMark: 4 * 1024
+        )
+        defer { stream.cancel() }
+
+        var collected = Data()
+        collected.reserveCapacity(expectedSmall.count)
+        var chunkIndex = 0
+        while let chunk = try await stream.nextChunk() {
+            collected.append(chunk)
+            chunkIndex += 1
+            // Periodically pause briefly so producer hits high-water mark while consumer races to drain
+            if chunkIndex % 7 == 0 {
+                try await Task.sleep(for: .milliseconds(2))
+            }
+        }
+        #expect(collected == expectedSmall)
+
+        // 2. End-to-end FileDownloader streaming > 4.5 MB across default 2 MB / 512 KB watermarks
+        let bigChunk = Data(repeating: 0x3C, count: 256 * 1024)
+        let bigChunkCount = 18 // 4.5 MB (> 2 MB high-water mark)
+        let bigTotalBytes = Int64(bigChunk.count * bigChunkCount)
+        var hasher = Insecure.MD5()
+        for _ in 0..<bigChunkCount { hasher.update(data: bigChunk) }
+        let bigMD5 = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+
+        let bigMock = MockSessionScope(chunkHandler: { request in
+            let resp = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Length": "\(bigTotalBytes)"]
+            )!
+            return (resp, Array(repeating: bigChunk, count: bigChunkCount))
+        })
+        defer { bigMock.invalidate() }
+
+        let bigFile = RemoteFile(
+            id: "big-bp",
+            filename: "large.bin",
+            downloadLink: "https://example.com/large.bin",
+            relativeDirectory: [],
+            expectedSize: bigTotalBytes,
+            md5: bigMD5
+        )
+        let downloader = FileDownloader(session: bigMock.session)
+        let outcome = try await downloader.download(file: bigFile, to: tempDir, accountToken: "tok") { _ in }
+        #expect(outcome == .downloaded(totalBytes: bigTotalBytes, resumed: false))
+    }
+
+    @Test("DiskFileWriter supports cancellable MD5 hashing and independent concurrent writers")
+    func diskFileWriterMD5CancellationAndConcurrentWrites() async throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let fileA = tempDir.appendingPathComponent("a.bin")
+        let fileB = tempDir.appendingPathComponent("b.bin")
+        let dataA = Data(repeating: 0x11, count: 512 * 1024)
+        let dataB = Data(repeating: 0x22, count: 512 * 1024)
+
+        // Concurrent writers complete independently
+        async let writeA: Void = {
+            let writer = try await DiskFileWriter.open(at: fileA, append: false)
+            try await writer.write(dataA)
+            try await writer.synchronizeAndClose()
+        }()
+        async let writeB: Void = {
+            let writer = try await DiskFileWriter.open(at: fileB, append: false)
+            try await writer.write(dataB)
+            try await writer.synchronizeAndClose()
+        }()
+        _ = try await (writeA, writeB)
+
+        #expect(try Data(contentsOf: fileA) == dataA)
+        #expect(try Data(contentsOf: fileB) == dataB)
+
+        let expectedMD5 = Insecure.MD5.hash(data: dataA).map { String(format: "%02x", $0) }.joined()
+        #expect(try await DiskFileWriter.md5Hex(of: fileA) == expectedMD5)
+
+        // Cancelled task entering md5Hex fails promptly with CancellationError
+        let cancelledTask = Task<String, Error> {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await DiskFileWriter.md5Hex(of: fileA)
+        }
+        await #expect(throws: CancellationError.self) {
+            _ = try await cancelledTask.value
+        }
+    }
 }

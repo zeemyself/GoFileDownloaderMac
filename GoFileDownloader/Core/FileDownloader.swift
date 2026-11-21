@@ -291,7 +291,9 @@ public struct FileDownloader: Sendable {
 
         let savedMeta: ResumeMetadata? = existingPartSize > 0 ? Self.loadResumeMetadata(from: metaURL) : nil
 
-        guard let requestURL = URL(string: file.downloadLink) else {
+        guard let requestURL = URL(string: file.downloadLink),
+              let scheme = requestURL.scheme?.lowercased(),
+              scheme == "https" || scheme == "http" else {
             throw GoFileError.invalidURL(file.downloadLink)
         }
 
@@ -451,7 +453,25 @@ public struct FileDownloader: Sendable {
             )
         }
 
-        let writer = try await DiskFileWriter.open(at: partURL, append: isPartial)
+        let writer = try await DiskFileWriter.open(at: partURL, append: isPartial) {
+            let localFM = FileManager.default
+            if let existingAttrs = try? localFM.attributesOfItem(atPath: stagingDir.path),
+               (existingAttrs[.type] as? FileAttributeType) != .typeDirectory {
+                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
+            }
+            try localFM.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+            guard let canonicalStaging = Self.resolveRealPath(stagingDir) else {
+                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
+            }
+            let stagingCheckPath = canonicalStaging.path.hasSuffix("/") ? canonicalStaging.path : canonicalStaging.path + "/"
+            guard stagingCheckPath.hasPrefix(basePrefix) else {
+                throw GoFileError.unsafePath(GoFileConfig.partialStagingDirectoryName)
+            }
+            if let partAttrs = try? localFM.attributesOfItem(atPath: partURL.path),
+               (partAttrs[.type] as? FileAttributeType) != .typeRegular {
+                throw GoFileError.unsafePath(file.relativePath)
+            }
+        }
         defer { writer.closeQuietly() }
 
         Self.saveResumeMetadata(
