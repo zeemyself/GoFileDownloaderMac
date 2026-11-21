@@ -155,19 +155,19 @@ public final class DownloadStore {
 
     public var downloadFolder: URL {
         didSet {
-            UserDefaults.standard.set(downloadFolder.path, forKey: Self.downloadFolderKey)
+            userDefaults.set(downloadFolder.path, forKey: Self.downloadFolderKey)
         }
     }
 
     public var maxConcurrent: Int {
         didSet {
-            UserDefaults.standard.set(maxConcurrent, forKey: Self.maxConcurrentKey)
+            userDefaults.set(maxConcurrent, forKey: Self.maxConcurrentKey)
         }
     }
 
     public var maxRetries: Int {
         didSet {
-            UserDefaults.standard.set(maxRetries, forKey: Self.maxRetriesKey)
+            userDefaults.set(maxRetries, forKey: Self.maxRetriesKey)
         }
     }
 
@@ -177,18 +177,28 @@ public final class DownloadStore {
     public var logs: [LogEntry] = []
 
     private var itemByID: [String: DownloadItem] = [:]
-    private var activeTask: Task<Void, Never>?
-    private var singleRetryTasks: [String: Task<Void, Never>] = [:]
+    public private(set) var sessionID = UUID()
+    private var sessionToken = UUID()
+    private var sessionBaseDirectory: URL?
+    private var resolveTask: Task<Void, Never>?
+    private var tokenFetchTask: Task<String, Error>?
+    private var pendingQueue: [String] = []
+    private var runningWorkerTasks: [String: (token: UUID, task: Task<Void, Never>)] = [:]
     private var lastAccountToken: String?
     private let api: GoFileAPI
     private let engine: DownloadEngine
+    private let userDefaults: UserDefaults
 
-    public init(api: GoFileAPI = GoFileAPI(), engine: DownloadEngine = DownloadEngine()) {
+    public init(
+        api: GoFileAPI = GoFileAPI(),
+        engine: DownloadEngine = DownloadEngine(),
+        userDefaults: UserDefaults = .standard
+    ) {
         self.api = api
         self.engine = engine
+        self.userDefaults = userDefaults
 
-        let defaults = UserDefaults.standard
-        if let savedPath = defaults.string(forKey: Self.downloadFolderKey), !savedPath.isEmpty {
+        if let savedPath = userDefaults.string(forKey: Self.downloadFolderKey), !savedPath.isEmpty {
             self.downloadFolder = URL(fileURLWithPath: savedPath, isDirectory: true)
         } else {
             let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -196,11 +206,11 @@ public final class DownloadStore {
             self.downloadFolder = downloads.appendingPathComponent("GoFile", isDirectory: true)
         }
 
-        let savedConcurrent = defaults.integer(forKey: Self.maxConcurrentKey)
-        self.maxConcurrent = savedConcurrent > 0 ? savedConcurrent : GoFileConfig.defaultMaxWorkers
+        let savedConcurrent = userDefaults.integer(forKey: Self.maxConcurrentKey)
+        self.maxConcurrent = savedConcurrent > 0 ? min(8, savedConcurrent) : GoFileConfig.defaultMaxWorkers
 
-        if defaults.object(forKey: Self.maxRetriesKey) != nil {
-            self.maxRetries = max(0, defaults.integer(forKey: Self.maxRetriesKey))
+        if userDefaults.object(forKey: Self.maxRetriesKey) != nil {
+            self.maxRetries = max(0, min(10, userDefaults.integer(forKey: Self.maxRetriesKey)))
         } else {
             self.maxRetries = GoFileConfig.defaultMaxRetries
         }
@@ -287,14 +297,15 @@ public final class DownloadStore {
 
     public func revealItem(_ item: DownloadItem) {
         let fm = FileManager.default
-        let partURL = FileDownloader.partURL(for: item.destinationURL)
+        let partURL = FileDownloader.partURL(for: item.destinationURL, fileID: item.id)
         if fm.fileExists(atPath: item.destinationURL.path) {
             NSWorkspace.shared.activateFileViewerSelecting([item.destinationURL])
         } else if fm.fileExists(atPath: partURL.path) {
             NSWorkspace.shared.activateFileViewerSelecting([partURL])
         } else {
             let folder = item.destinationURL.deletingLastPathComponent()
-            NSWorkspace.shared.open(fm.fileExists(atPath: folder.path) ? folder : downloadFolder)
+            let fallback = sessionBaseDirectory ?? downloadFolder
+            NSWorkspace.shared.open(fm.fileExists(atPath: folder.path) ? folder : fallback)
         }
     }
 
@@ -304,27 +315,55 @@ public final class DownloadStore {
     }
 
     public func retryItems(withIDs ids: Set<DownloadItem.ID>, forceRestart: Bool = false) {
-        for id in ids {
-            guard let item = itemByID[id] else { continue }
-            retryItem(item, forceRestart: forceRestart)
+        let orderedItems = items.filter { ids.contains($0.id) }
+        var queuedAny = false
+        for item in orderedItems {
+            if prepareForRetry(item, forceRestart: forceRestart) {
+                queuedAny = true
+            }
+        }
+        if queuedAny {
+            startQueuedRetriesIfNeeded()
+        } else {
+            finalizeSessionStateIfIdle()
         }
     }
 
     public func retryItem(_ item: DownloadItem, forceRestart: Bool = false) {
-        switch item.status {
-        case .downloading, .retrying:
-            return
-        default:
-            break
+        if prepareForRetry(item, forceRestart: forceRestart) {
+            startQueuedRetriesIfNeeded()
+        } else {
+            finalizeSessionStateIfIdle()
         }
+    }
 
-        singleRetryTasks[item.id]?.cancel()
+    private func prepareForRetry(_ item: DownloadItem, forceRestart: Bool) -> Bool {
+        guard item.status.isTerminal else { return false }
+        guard runningWorkerTasks[item.id] == nil, !pendingQueue.contains(item.id) else {
+            return false
+        }
 
         if forceRestart {
             let fm = FileManager.default
-            let partURL = FileDownloader.partURL(for: item.destinationURL)
-            try? fm.removeItem(at: item.destinationURL)
-            try? fm.removeItem(at: partURL)
+            let partURL = FileDownloader.partURL(for: item.destinationURL, fileID: item.id)
+            let metaURL = FileDownloader.resumeMetaURL(for: partURL)
+            do {
+                if fm.fileExists(atPath: item.destinationURL.path) {
+                    try fm.removeItem(at: item.destinationURL)
+                }
+                if fm.fileExists(atPath: partURL.path) {
+                    try fm.removeItem(at: partURL)
+                }
+                if fm.fileExists(atPath: metaURL.path) {
+                    try? fm.removeItem(at: metaURL)
+                }
+            } catch {
+                let details = "Could not remove existing file for \(item.filename): \(error.localizedDescription)"
+                item.resetSpeed()
+                item.status = .failed(details)
+                appendLog(event: "Failed download", details: details)
+                return false
+            }
             item.bytesReceived = 0
         }
 
@@ -333,65 +372,148 @@ public final class DownloadStore {
         if !state.isActive {
             state = .downloading
         }
-
-        let targetFolder = downloadFolder
-        let retries = maxRetries
-        let remoteFile = item.remoteFile
+        pendingQueue.append(item.id)
 
         appendLog(
             event: "Retrying download",
             details: "Manually retrying \(item.filename)\(forceRestart ? " from scratch" : "")..."
         )
+        return true
+    }
 
-        singleRetryTasks[item.id] = Task { [weak self] in
+    private func startQueuedRetriesIfNeeded() {
+        guard resolveTask == nil else { return }
+        if lastAccountToken != nil {
+            pumpQueue()
+            return
+        }
+        guard tokenFetchTask == nil else { return }
+
+        let capturedSessionToken = sessionToken
+        let fetchTask = Task<String, Error> {
+            try await self.api.createAccountToken()
+        }
+        tokenFetchTask = fetchTask
+
+        Task { @MainActor [weak self] in
             guard let self else { return }
-            defer {
-                self.singleRetryTasks[remoteFile.id] = nil
-                self.recomputeSessionStateIfIdle()
-            }
             do {
-                let token: String
-                if let cached = self.lastAccountToken {
-                    token = cached
-                } else {
-                    let fresh = try await self.api.createAccountToken()
-                    self.lastAccountToken = fresh
-                    token = fresh
-                }
-
-                await self.engine.runAll(
-                    files: [remoteFile],
-                    baseDirectory: targetFolder,
-                    accountToken: token,
-                    maxConcurrent: 1,
-                    maxRetries: retries
-                ) { [weak self] event in
-                    await self?.handleEngineEvent(event)
-                }
+                let token = try await fetchTask.value
+                guard self.sessionToken == capturedSessionToken else { return }
+                self.lastAccountToken = token
+                self.tokenFetchTask = nil
+                self.pumpQueue()
+            } catch is CancellationError {
+                guard self.sessionToken == capturedSessionToken else { return }
+                self.tokenFetchTask = nil
+                self.cancelPendingItemsAndFinalize()
+            } catch let urlError as URLError where urlError.code == .cancelled {
+                guard self.sessionToken == capturedSessionToken else { return }
+                self.tokenFetchTask = nil
+                self.cancelPendingItemsAndFinalize()
             } catch {
-                let details = "Failed to retry \(remoteFile.filename): \(error.localizedDescription)"
-                item.status = .failed(details)
-                self.appendLog(event: "Failed download", details: details)
+                guard self.sessionToken == capturedSessionToken else { return }
+                self.tokenFetchTask = nil
+                let queuedIDs = self.pendingQueue
+                self.pendingQueue.removeAll()
+                for id in queuedIDs {
+                    if let queuedItem = self.itemByID[id], !queuedItem.status.isTerminal {
+                        let details = "Failed to retry \(queuedItem.filename): \(error.localizedDescription)"
+                        queuedItem.resetSpeed()
+                        queuedItem.status = .failed(details)
+                        self.appendLog(event: "Failed download", details: details)
+                    }
+                }
+                self.finalizeSessionStateIfIdle()
             }
         }
     }
 
-    private func recomputeSessionStateIfIdle() {
-        guard activeTask == nil, singleRetryTasks.isEmpty else { return }
-        let anyRunning = items.contains {
-            switch $0.status {
-            case .downloading, .retrying, .queued: return true
-            default: return false
-            }
+    private func cancelPendingItemsAndFinalize() {
+        pendingQueue.removeAll()
+        for item in items where !item.status.isTerminal {
+            item.status = .cancelled
+            item.resetSpeed()
         }
+        finalizeSessionStateIfIdle()
+    }
+
+    private func pumpQueue() {
+        guard resolveTask == nil else { return }
+        let concurrency = max(1, maxConcurrent)
+
+        if pendingQueue.isEmpty {
+            finalizeSessionStateIfIdle()
+            return
+        }
+
+        guard let token = lastAccountToken else {
+            startQueuedRetriesIfNeeded()
+            return
+        }
+
+        let targetFolder = sessionBaseDirectory ?? downloadFolder
+        let retries = maxRetries
+        let capturedSessionToken = sessionToken
+
+        while runningWorkerTasks.count < concurrency, !pendingQueue.isEmpty {
+            let fileID = pendingQueue.removeFirst()
+            guard let item = itemByID[fileID], !item.status.isTerminal else { continue }
+            guard runningWorkerTasks[fileID] == nil else { continue }
+
+            let workerToken = UUID()
+            let remoteFile = item.remoteFile
+            let task = Task { [weak self] in
+                guard let self else { return }
+                defer {
+                    if self.sessionToken == capturedSessionToken,
+                       self.runningWorkerTasks[fileID]?.token == workerToken {
+                        self.runningWorkerTasks[fileID] = nil
+                        self.pumpQueue()
+                    }
+                }
+
+                await self.engine.downloadFileWithRetries(
+                    file: remoteFile,
+                    baseDirectory: targetFolder,
+                    accountToken: token,
+                    maxRetries: retries
+                ) { [weak self] event in
+                    await self?.handleEngineEvent(event, sessionToken: capturedSessionToken)
+                }
+            }
+            runningWorkerTasks[fileID] = (token: workerToken, task: task)
+        }
+
+        finalizeSessionStateIfIdle()
+    }
+
+    private func finalizeSessionStateIfIdle() {
+        guard resolveTask == nil,
+              tokenFetchTask == nil,
+              runningWorkerTasks.isEmpty,
+              pendingQueue.isEmpty else {
+            return
+        }
+        guard !items.isEmpty else { return }
+        let anyRunning = items.contains { !$0.status.isTerminal }
         guard !anyRunning else { return }
 
+        let targetFolder = sessionBaseDirectory ?? downloadFolder
         if failedFilesCount > 0 {
             state = .failed("\(failedFilesCount) file(s) failed.")
+            appendLog(
+                event: "Finished with errors",
+                details: "\(completedFilesCount)/\(items.count) completed, \(failedFilesCount) failed."
+            )
         } else if items.contains(where: { $0.status == .cancelled }) {
             state = .cancelled
-        } else if !items.isEmpty {
+        } else {
             state = .finished
+            appendLog(
+                event: "Completed",
+                details: "All \(items.count) file(s) processed into \(targetFolder.path)."
+            )
         }
     }
 
@@ -409,7 +531,11 @@ public final class DownloadStore {
             return
         }
 
+        cancelInternalTasks(advanceSessionToken: true)
+        let capturedSessionToken = sessionToken
+
         needsPasswordPrompt = false
+        sessionID = UUID()
         contentID = cid
         state = .resolving
         items.removeAll()
@@ -417,19 +543,24 @@ public final class DownloadStore {
 
         let password = passwordInput.isEmpty ? nil : passwordInput
         let targetFolder = downloadFolder
+        sessionBaseDirectory = targetFolder
         let workers = maxConcurrent
-        let retries = maxRetries
 
         appendLog(event: "Starting", details: "Resolving album \(cid)...")
 
-        activeTask = Task { [weak self] in
+        resolveTask = Task { [weak self] in
             guard let self else { return }
-            defer { self.activeTask = nil }
+            defer {
+                if self.sessionToken == capturedSessionToken {
+                    self.resolveTask = nil
+                }
+            }
             do {
                 try FileManager.default.createDirectory(at: targetFolder, withIntermediateDirectories: true)
                 let token = try await self.api.createAccountToken()
-                self.lastAccountToken = token
                 try Task.checkCancellation()
+                guard self.sessionToken == capturedSessionToken else { return }
+                self.lastAccountToken = token
 
                 let remoteFiles = try await self.api.resolveFiles(
                     contentID: cid,
@@ -437,6 +568,7 @@ public final class DownloadStore {
                     accountToken: token
                 )
                 try Task.checkCancellation()
+                guard self.sessionToken == capturedSessionToken else { return }
 
                 if remoteFiles.isEmpty {
                     self.appendLog(event: "Empty album", details: "No downloadable files found in \(cid).")
@@ -444,57 +576,46 @@ public final class DownloadStore {
                     return
                 }
 
-                let newItems = remoteFiles.map { DownloadItem(remoteFile: $0, baseDirectory: targetFolder) }
+                var seen = Set<String>()
+                let uniqueFiles = remoteFiles.filter { seen.insert($0.id).inserted }
+                let newItems = uniqueFiles.map { DownloadItem(remoteFile: $0, baseDirectory: targetFolder) }
                 self.items = newItems
-                self.itemByID = Dictionary(uniqueKeysWithValues: newItems.map { ($0.id, $0) })
+                self.itemByID = Dictionary(newItems.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                 self.state = .downloading
                 self.appendLog(
                     event: "Queued",
                     details: "Found \(newItems.count) file(s) in \(cid). Downloading with \(workers) worker(s)..."
                 )
 
-                await self.engine.runAll(
-                    files: remoteFiles,
-                    baseDirectory: targetFolder,
-                    accountToken: token,
-                    maxConcurrent: workers,
-                    maxRetries: retries
-                ) { [weak self] event in
-                    await self?.handleEngineEvent(event)
-                }
-
-                if Task.isCancelled {
-                    for item in self.items where !item.status.isTerminal {
-                        item.status = .cancelled
-                        item.resetSpeed()
-                    }
-                    self.state = .cancelled
-                    self.appendLog(event: "Cancelled", details: "Download cancelled. Partial (.part) files were kept for resume.")
-                } else if self.failedFilesCount > 0 {
-                    self.state = .failed("\(self.failedFilesCount) file(s) failed.")
-                    self.appendLog(
-                        event: "Finished with errors",
-                        details: "\(self.completedFilesCount)/\(self.items.count) completed, \(self.failedFilesCount) failed."
-                    )
-                } else {
-                    self.state = .finished
-                    self.appendLog(
-                        event: "Completed",
-                        details: "All \(self.items.count) file(s) processed into \(targetFolder.path)."
-                    )
-                }
+                self.pendingQueue.append(contentsOf: newItems.map(\.id))
+                self.resolveTask = nil
+                self.pumpQueue()
             } catch is CancellationError {
-                self.state = .cancelled
-                self.appendLog(event: "Cancelled", details: "Operation cancelled by user.")
+                guard self.sessionToken == capturedSessionToken else { return }
+                if self.state != .cancelled {
+                    self.state = .cancelled
+                    self.appendLog(event: "Cancelled", details: "Operation cancelled by user.")
+                }
+            } catch let urlError as URLError where urlError.code == .cancelled {
+                guard self.sessionToken == capturedSessionToken else { return }
+                if self.state != .cancelled {
+                    self.state = .cancelled
+                    self.appendLog(event: "Cancelled", details: "Operation cancelled by user.")
+                }
             } catch let error as GoFileError {
-                if error == .passwordRequired {
+                guard self.sessionToken == capturedSessionToken else { return }
+                if error == .passwordRequired || error == .wrongPassword {
                     self.needsPasswordPrompt = true
-                    self.appendLog(event: "Missing password", details: error.localizedDescription)
+                    self.appendLog(
+                        event: error == .wrongPassword ? "Wrong password" : "Missing password",
+                        details: error.localizedDescription
+                    )
                 } else {
                     self.appendLog(event: "Failed request", details: error.localizedDescription)
                 }
                 self.state = .failed(error.localizedDescription)
             } catch {
+                guard self.sessionToken == capturedSessionToken else { return }
                 let details = error.localizedDescription
                 self.appendLog(event: "Failed request", details: details)
                 self.state = .failed(details)
@@ -503,15 +624,43 @@ public final class DownloadStore {
     }
 
     public func cancelDownload() {
-        activeTask?.cancel()
-        activeTask = nil
-        for (_, task) in singleRetryTasks {
-            task.cancel()
+        let wasResolving = resolveTask != nil || state == .resolving
+        cancelInternalTasks(advanceSessionToken: true)
+
+        var cancelledAnyItem = false
+        for item in items where !item.status.isTerminal {
+            item.status = .cancelled
+            item.resetSpeed()
+            cancelledAnyItem = true
         }
-        singleRetryTasks.removeAll()
+
+        if wasResolving || cancelledAnyItem || state.isActive {
+            state = .cancelled
+            let message = wasResolving && items.isEmpty
+                ? "Operation cancelled by user."
+                : "Download cancelled. Partial (.part) files were kept for resume."
+            appendLog(event: "Cancelled", details: message)
+        }
     }
 
-    private func handleEngineEvent(_ event: DownloadEngineEvent) {
+    private func cancelInternalTasks(advanceSessionToken: Bool) {
+        if advanceSessionToken {
+            sessionToken = UUID()
+        }
+        resolveTask?.cancel()
+        resolveTask = nil
+        tokenFetchTask?.cancel()
+        tokenFetchTask = nil
+        pendingQueue.removeAll()
+        for (_, entry) in runningWorkerTasks {
+            entry.task.cancel()
+        }
+        runningWorkerTasks.removeAll()
+    }
+
+    private func handleEngineEvent(_ event: DownloadEngineEvent, sessionToken: UUID) {
+        guard self.sessionToken == sessionToken else { return }
+
         switch event {
         case .fileStarted(let id, let resumedFrom):
             guard let item = itemByID[id] else { return }
@@ -567,6 +716,11 @@ public final class DownloadStore {
                 event: "Failed download",
                 details: errorDetails
             )
+
+        case .fileCancelled(let id):
+            guard let item = itemByID[id], !item.status.isTerminal else { return }
+            item.resetSpeed()
+            item.status = .cancelled
         }
     }
 
