@@ -12,6 +12,11 @@ public enum GoFileConfig {
     public static let defaultMaxWorkers = 3
     public static let defaultMaxRetries = 3
 
+    public static let maxPathComponentUTF8Bytes = 220
+    public static let maxFolderRecursionDepth = 32
+    public static let maxPaginationPages = 100
+    public static let partialStagingDirectoryName = ".gofile-partial"
+
     public static let kb = 1024
     public static let mb = 1024 * kb
 
@@ -49,6 +54,12 @@ public enum GoFileConfig {
         headers["Sec-Fetch-Site"] = "same-site"
         headers["Pragma"] = "no-cache"
         headers["Cache-Control"] = "no-cache"
+        return headers
+    }
+
+    public static var downloadHeaders: [String: String] {
+        var headers = extendedHeaders
+        headers["Accept-Encoding"] = "identity"
         return headers
     }
 }

@@ -7,6 +7,7 @@ public enum DownloadEngineEvent: Sendable {
     case fileSkipped(fileID: String, filename: String, totalBytes: Int64)
     case fileCompleted(fileID: String, filename: String, totalBytes: Int64, resumed: Bool)
     case fileFailed(fileID: String, filename: String, errorDetails: String)
+    case fileCancelled(fileID: String)
 }
 
 public struct DownloadEngine: Sendable {
@@ -34,7 +35,7 @@ public struct DownloadEngine: Sendable {
             while active < concurrency, let next = iterator.next() {
                 active += 1
                 group.addTask {
-                    await self.downloadWithRetries(
+                    await self.downloadFileWithRetries(
                         file: next,
                         baseDirectory: baseDirectory,
                         accountToken: accountToken,
@@ -48,12 +49,15 @@ public struct DownloadEngine: Sendable {
                 active -= 1
                 if Task.isCancelled {
                     group.cancelAll()
+                    while let remaining = iterator.next() {
+                        await onEvent(.fileCancelled(fileID: remaining.id))
+                    }
                     break
                 }
                 if let next = iterator.next() {
                     active += 1
                     group.addTask {
-                        await self.downloadWithRetries(
+                        await self.downloadFileWithRetries(
                             file: next,
                             baseDirectory: baseDirectory,
                             accountToken: accountToken,
@@ -66,17 +70,21 @@ public struct DownloadEngine: Sendable {
         }
     }
 
-    private func downloadWithRetries(
+    public func downloadFileWithRetries(
         file: RemoteFile,
         baseDirectory: URL,
         accountToken: String,
         maxRetries: Int,
         onEvent: @escaping @Sendable (DownloadEngineEvent) async -> Void
     ) async {
-        let totalAttempts = 1 + maxRetries
+        let retries = max(0, maxRetries)
+        let totalAttempts = 1 + retries
 
         for attempt in 1...totalAttempts {
-            if Task.isCancelled { return }
+            if Task.isCancelled {
+                await onEvent(.fileCancelled(fileID: file.id))
+                return
+            }
 
             do {
                 let outcome = try await fileDownloader.download(
@@ -104,29 +112,52 @@ public struct DownloadEngine: Sendable {
                 }
                 return
             } catch is CancellationError {
+                await onEvent(.fileCancelled(fileID: file.id))
                 return
             } catch let urlError as URLError where urlError.code == .cancelled {
+                await onEvent(.fileCancelled(fileID: file.id))
                 return
             } catch {
-                if Task.isCancelled { return }
+                if Task.isCancelled {
+                    await onEvent(.fileCancelled(fileID: file.id))
+                    return
+                }
                 let details = formatErrorDetails(filename: file.filename, error: error)
-                if attempt <= maxRetries {
+                if attempt <= retries && Self.isRetryableError(error) {
                     let backoffMillis = Self.retryDelayMilliseconds(attempt: attempt, error: error)
                     await onEvent(
                         .fileRetrying(
                             fileID: file.id,
                             attempt: attempt,
-                            maxRetries: maxRetries,
+                            maxRetries: retries,
                             delayMillis: backoffMillis,
                             reason: details
                         )
                     )
-                    try? await Task.sleep(for: .milliseconds(backoffMillis))
+                    do {
+                        try await Task.sleep(for: .milliseconds(backoffMillis))
+                    } catch {
+                        await onEvent(.fileCancelled(fileID: file.id))
+                        return
+                    }
                 } else {
                     await onEvent(.fileFailed(fileID: file.id, filename: file.filename, errorDetails: details))
+                    return
                 }
             }
         }
+    }
+
+    private static func isRetryableError(_ error: Error) -> Bool {
+        if let goFileError = error as? GoFileError {
+            switch goFileError {
+            case .unsafePath, .invalidURL:
+                return false
+            default:
+                return true
+            }
+        }
+        return true
     }
 
     /// Computes exponential backoff with random jitter in milliseconds.

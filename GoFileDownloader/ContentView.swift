@@ -53,6 +53,9 @@ struct ContentView: View {
                 focusedField = .password
             }
         }
+        .onChange(of: store.sessionID) { _, _ in
+            selectedItemIDs.removeAll()
+        }
     }
 
     // MARK: - Header Controls
@@ -393,34 +396,35 @@ struct ContentView: View {
     private func rowContextMenu(for ids: Set<DownloadItem.ID>) -> some View {
         let selectedItems = store.items.filter { ids.contains($0.id) }
         if let first = selectedItems.first {
-            let canRetry = selectedItems.contains {
-                switch $0.status {
-                case .failed, .cancelled, .completed, .skipped, .queued:
-                    return true
-                case .downloading, .retrying:
-                    return false
+            let resumableIDs = Set(selectedItems.compactMap { item -> DownloadItem.ID? in
+                switch item.status {
+                case .failed, .cancelled:
+                    return item.id
+                case .queued, .downloading, .retrying, .completed, .skipped:
+                    return nil
                 }
-            }
+            })
+            let terminalIDs = Set(selectedItems.compactMap { $0.status.isTerminal ? $0.id : nil })
 
             Button {
-                store.retryItems(withIDs: ids, forceRestart: false)
+                store.retryItems(withIDs: resumableIDs, forceRestart: false)
             } label: {
                 Label(
-                    selectedItems.count > 1 ? "Retry / Resume Selected (\(selectedItems.count))" : "Retry / Resume Download",
+                    resumableIDs.count > 1 ? "Retry / Resume Selected (\(resumableIDs.count))" : "Retry / Resume Download",
                     systemImage: "arrow.clockwise"
                 )
             }
-            .disabled(!canRetry)
+            .disabled(resumableIDs.isEmpty)
 
             Button {
-                store.retryItems(withIDs: ids, forceRestart: true)
+                store.retryItems(withIDs: terminalIDs, forceRestart: true)
             } label: {
                 Label(
-                    selectedItems.count > 1 ? "Re-download Selected from Scratch" : "Re-download from Scratch",
+                    terminalIDs.count > 1 ? "Re-download Selected from Scratch (\(terminalIDs.count))" : "Re-download from Scratch",
                     systemImage: "arrow.triangle.2.circlepath"
                 )
             }
-            .disabled(!canRetry)
+            .disabled(terminalIDs.isEmpty)
 
             Divider()
 
@@ -565,7 +569,7 @@ struct ContentView: View {
     }
 
     private func logEventColor(_ event: String) -> Color {
-        if event.contains("Failed") || event.contains("Invalid") || event.contains("Missing") {
+        if event.contains("Failed") || event.contains("Invalid") || event.contains("Missing") || event.contains("Wrong") {
             return .red
         } else if event.contains("Retry") || event.contains("Cancel") {
             return .orange
