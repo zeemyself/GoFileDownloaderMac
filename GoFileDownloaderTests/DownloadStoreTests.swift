@@ -103,9 +103,12 @@ struct DownloadStoreTests {
         )
         store.downloadFolder = tempDir
 
-        // Invalid URL
+        // Invalid URL does not validate until submit; submit flags hasInvalidURL and fails
         store.urlInput = "https://evil.com/d/abc123"
+        #expect(store.canStart == true)
+        #expect(store.hasInvalidURL == false)
         store.startDownload()
+        #expect(store.hasInvalidURL == true)
         if case .failed = store.state {
             // Expected
         } else {
@@ -113,6 +116,7 @@ struct DownloadStoreTests {
         }
         store.dismissFeedback()
         #expect(store.state == .idle)
+        #expect(store.hasInvalidURL == false)
 
         // Wrong password triggers needsPasswordPrompt and keeps error visible
         store.urlInput = "https://gofile.io/d/sec1"
@@ -295,5 +299,85 @@ struct DownloadStoreTests {
 
         item.resetSpeed()
         #expect(item.speedBytesPerSec == 0)
+    }
+
+    @Test("Bare content ID auto-expands on download start and URL validation occurs on submit")
+    @MainActor
+    func bareContentIDAutoExpandsAndValidatesOnSubmit() async throws {
+        let (suite, defaults) = makeIsolatedDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let accountJSON = #"{"status":"ok","data":{"token":"tok-bare"}}"#
+        let contentsJSON = """
+        {
+          "status": "ok",
+          "data": {
+            "id": "clgeTz",
+            "type": "folder",
+            "name": "BareAlbum",
+            "children": {
+              "f1": { "id": "f1", "type": "file", "name": "clip.txt", "link": "https://cdn.example.com/clip", "size": 4, "createTime": 1 }
+            }
+          }
+        }
+        """
+
+        let mock = MockSessionScope { request in
+            let urlStr = request.url?.absoluteString ?? ""
+            if urlStr.contains("/accounts") {
+                return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(accountJSON.utf8))
+            }
+            if urlStr.contains("/contents/clgeTz") {
+                return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(contentsJSON.utf8))
+            }
+            let body = Data("test".utf8)
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Length": "4"])!, body)
+        }
+        defer { mock.invalidate() }
+
+        let store = DownloadStore(
+            api: GoFileAPI(session: mock.session),
+            engine: DownloadEngine(fileDownloader: FileDownloader(session: mock.session)),
+            userDefaults: defaults
+        )
+        store.downloadFolder = tempDir
+
+        // Empty or whitespace-only input disables start
+        store.urlInput = "   "
+        #expect(store.canStart == false)
+
+        // Editing invalid text does not set hasInvalidURL until submit
+        store.urlInput = "d/clgeTz"
+        #expect(store.canStart == true)
+        #expect(store.hasInvalidURL == false)
+        store.startDownload()
+        #expect(store.hasInvalidURL == true)
+        if case .failed = store.state {
+            // Expected
+        } else {
+            Issue.record("Expected failed state for partial path input")
+        }
+
+        // Editing urlInput clears hasInvalidURL
+        store.urlInput = "  clgeTz  "
+        #expect(store.hasInvalidURL == false)
+        #expect(store.parsedContentID == "clgeTz")
+
+        // Starting download with bare ID auto-expands urlInput and downloads cleanly
+        store.startDownload()
+        #expect(store.urlInput == "https://gofile.io/d/clgeTz")
+        #expect(store.contentID == "clgeTz")
+        #expect(store.hasInvalidURL == false)
+
+        for _ in 0..<200 {
+            if store.state == .finished { break }
+            try await Task.sleep(for: .milliseconds(15))
+        }
+
+        #expect(store.state == .finished)
+        #expect(store.completedFilesCount == 1)
+        #expect(store.failedFilesCount == 0)
     }
 }

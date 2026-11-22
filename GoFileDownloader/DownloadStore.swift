@@ -149,9 +149,16 @@ public final class DownloadStore {
     public static let maxConcurrentKey = "maxConcurrentDownloads"
     public static let maxRetriesKey = "maxDownloadRetries"
 
-    public var urlInput: String = ""
+    public var urlInput: String = "" {
+        didSet {
+            if hasInvalidURL, urlInput != oldValue {
+                hasInvalidURL = false
+            }
+        }
+    }
     public var passwordInput: String = ""
     public var needsPasswordPrompt: Bool = false
+    public var hasInvalidURL: Bool = false
 
     public var downloadFolder: URL {
         didSet {
@@ -223,7 +230,7 @@ public final class DownloadStore {
     }
 
     public var canStart: Bool {
-        !state.isActive && parsedContentID != nil
+        !state.isActive && !urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     public var completedFilesCount: Int {
@@ -526,6 +533,7 @@ public final class DownloadStore {
     public func dismissFeedback() {
         guard !state.isActive else { return }
         needsPasswordPrompt = false
+        hasInvalidURL = false
         if items.isEmpty {
             state = .idle
             contentID = nil
@@ -536,10 +544,18 @@ public final class DownloadStore {
         guard !state.isActive else { return }
         let trimmedURL = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let cid = GoFileAPI.contentID(from: trimmedURL) else {
-            let msg = "\(trimmedURL) is not a valid GoFile URL."
+            hasInvalidURL = true
+            let msg = trimmedURL.isEmpty
+                ? "Please enter a valid GoFile URL or ID."
+                : "\(trimmedURL) is not a valid GoFile URL or ID."
             appendLog(event: "Invalid URL", details: msg)
             state = .failed(msg)
             return
+        }
+
+        hasInvalidURL = false
+        if trimmedURL == cid {
+            urlInput = GoFileAPI.webURL(forContentID: cid)
         }
 
         cancelInternalTasks(advanceSessionToken: true)

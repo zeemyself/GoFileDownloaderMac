@@ -83,17 +83,31 @@ public actor GoFileAPI {
 
     // MARK: - Pure helpers
 
-    /// Extracts the content ID from a valid GoFile URL (`https://[*.]gofile.io/d/<id>`).
+    /// Canonical web URL for a GoFile content ID (`https://gofile.io/d/<id>`).
+    public static func webURL(forContentID contentID: String) -> String {
+        "https://gofile.io/d/\(contentID)"
+    }
+
+    /// Extracts the content ID from a valid GoFile URL (`https://[*.]gofile.io/d/<id>`)
+    /// or a bare content ID (`<id>`).
     public static func contentID(from url: String) -> String? {
         let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        if Self.isValidContentID(trimmed) {
+            return trimmed
+        }
         guard let components = URLComponents(string: trimmed),
               let scheme = components.scheme?.lowercased(),
               scheme == "https" || scheme == "http",
+              components.user == nil,
+              components.password == nil,
               let host = components.host?.lowercased(),
               host == "gofile.io" || (!host.hasPrefix(".") && host.hasSuffix(".gofile.io")) else {
             return nil
         }
-        let pathSegments = components.path
+        let pathSegments = components.percentEncodedPath
             .split(separator: "/", omittingEmptySubsequences: true)
             .map(String.init)
         guard pathSegments.count == 2, pathSegments[0] == "d" else {

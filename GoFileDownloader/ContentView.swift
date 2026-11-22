@@ -62,6 +62,12 @@ struct ContentView: View {
                 focusedField = .password
             }
         }
+        .onChange(of: store.hasInvalidURL) { _, hasInvalidURL in
+            if hasInvalidURL {
+                focusedField = .url
+                bannerDismissed = false
+            }
+        }
         .onChange(of: store.sessionID) { _, _ in
             selectedItemIDs.removeAll()
             bannerDismissed = false
@@ -78,8 +84,8 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 HStack(spacing: 6) {
                     Image(systemName: "link")
-                        .foregroundStyle(.secondary)
-                    TextField("https://gofile.io/d/...", text: $store.urlInput)
+                        .foregroundStyle(store.hasInvalidURL ? .red : .secondary)
+                    TextField("https://gofile.io/d/... or ID", text: $store.urlInput)
                         .textFieldStyle(.plain)
                         .focused($focusedField, equals: .url)
                         .onSubmit {
@@ -117,7 +123,10 @@ struct ContentView: View {
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 7)
-                        .strokeBorder(urlBorderColor, lineWidth: 1)
+                        .strokeBorder(
+                            store.hasInvalidURL ? Color.red.opacity(0.7) : Color.secondary.opacity(0.25),
+                            lineWidth: store.hasInvalidURL ? 1.5 : 1
+                        )
                 )
                 .disabled(store.state.isActive)
 
@@ -209,14 +218,6 @@ struct ContentView: View {
             }
             .font(.caption)
         }
-    }
-
-    private var urlBorderColor: Color {
-        let trimmed = store.urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            return Color.secondary.opacity(0.25)
-        }
-        return store.parsedContentID != nil ? Color.accentColor.opacity(0.6) : Color.red.opacity(0.7)
     }
 
     // MARK: - Overall Summary Bar
@@ -324,9 +325,15 @@ struct ContentView: View {
             )
         }
         if case .failed(let msg) = store.state {
+            let title: String
+            if store.hasInvalidURL {
+                title = "Invalid GoFile Link"
+            } else {
+                title = store.items.isEmpty ? "Unable to Load Album" : "Download Finished with Errors"
+            }
             return FeedbackBannerModel(
                 icon: "exclamationmark.triangle.fill",
-                title: store.items.isEmpty ? "Unable to Load Album" : "Download Finished with Errors",
+                title: title,
                 message: msg,
                 tint: .red
             )
@@ -372,9 +379,8 @@ struct ContentView: View {
 
                 if !store.state.isActive {
                     Button("Dismiss") {
-                        if store.items.isEmpty {
-                            store.dismissFeedback()
-                        } else {
+                        store.dismissFeedback()
+                        if !store.items.isEmpty {
                             bannerDismissed = true
                         }
                     }
@@ -427,7 +433,7 @@ struct ContentView: View {
             ContentUnavailableView {
                 Label("Download Cancelled", systemImage: "pause.circle")
             } description: {
-                Text("Enter a GoFile album link above or click Download to try again.")
+                Text("Enter a GoFile album link or ID above or click Download to try again.")
             }
         case .finished:
             ContentUnavailableView {
@@ -439,7 +445,7 @@ struct ContentView: View {
             ContentUnavailableView {
                 Label("No Active Downloads", systemImage: "arrow.down.doc")
             } description: {
-                Text("Enter a GoFile album link (e.g. https://gofile.io/d/xxxxxx) above and click Download.")
+                Text("Enter a GoFile album link or ID (e.g. https://gofile.io/d/xxxxxx or xxxxxx) above and click Download.")
             }
         }
     }
