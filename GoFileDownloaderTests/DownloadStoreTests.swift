@@ -360,9 +360,10 @@ struct DownloadStoreTests {
             Issue.record("Expected failed state for partial path input")
         }
 
-        // Editing urlInput clears hasInvalidURL
+        // Editing urlInput clears both hasInvalidURL and the stale validation .failed state
         store.urlInput = "  clgeTz  "
         #expect(store.hasInvalidURL == false)
+        #expect(store.state == .idle)
         #expect(store.parsedContentID == "clgeTz")
 
         // Starting download with bare ID auto-expands urlInput and downloads cleanly
@@ -379,5 +380,32 @@ struct DownloadStoreTests {
         #expect(store.state == .finished)
         #expect(store.completedFilesCount == 1)
         #expect(store.failedFilesCount == 0)
+
+        // Submitting an invalid input after a completed session preserves the prior .finished state on edit or dismiss
+        store.urlInput = "gofile.io/d/clgeTz"
+        store.startDownload()
+        #expect(store.hasInvalidURL == true)
+        if case .failed = store.state {
+            // Expected
+        } else {
+            Issue.record("Expected failed state for scheme-less URL input")
+        }
+
+        // Repeated invalid submit keeps the original pre-validation .finished state
+        store.startDownload()
+        #expect(store.hasInvalidURL == true)
+
+        // Editing urlInput restores the previous .finished session state
+        store.urlInput = "clgeTz"
+        #expect(store.hasInvalidURL == false)
+        #expect(store.state == .finished)
+
+        // Dismissing an invalid URL after a completed session also restores .finished
+        store.urlInput = "https://evil.com/d/clgeTz"
+        store.startDownload()
+        #expect(store.hasInvalidURL == true)
+        store.dismissFeedback()
+        #expect(store.hasInvalidURL == false)
+        #expect(store.state == .finished)
     }
 }

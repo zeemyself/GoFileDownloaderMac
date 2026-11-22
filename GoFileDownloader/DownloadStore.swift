@@ -152,7 +152,7 @@ public final class DownloadStore {
     public var urlInput: String = "" {
         didSet {
             if hasInvalidURL, urlInput != oldValue {
-                hasInvalidURL = false
+                clearInvalidURLFeedback()
             }
         }
     }
@@ -187,6 +187,7 @@ public final class DownloadStore {
     public private(set) var sessionID = UUID()
     private var sessionToken = UUID()
     private var sessionBaseDirectory: URL?
+    private var stateBeforeInvalidURL: SessionState?
     private var resolveTask: Task<Void, Never>?
     private var tokenFetchTask: Task<String, Error>?
     private var pendingQueue: [String] = []
@@ -349,6 +350,8 @@ public final class DownloadStore {
         guard runningWorkerTasks[item.id] == nil, !pendingQueue.contains(item.id) else {
             return false
         }
+        hasInvalidURL = false
+        stateBeforeInvalidURL = nil
 
         if forceRestart {
             let fm = FileManager.default
@@ -533,10 +536,30 @@ public final class DownloadStore {
     public func dismissFeedback() {
         guard !state.isActive else { return }
         needsPasswordPrompt = false
-        hasInvalidURL = false
+        if hasInvalidURL {
+            clearInvalidURLFeedback()
+            return
+        }
         if items.isEmpty {
             state = .idle
             contentID = nil
+        }
+    }
+
+    private func clearInvalidURLFeedback() {
+        guard hasInvalidURL else { return }
+        hasInvalidURL = false
+        let previousState = stateBeforeInvalidURL
+        stateBeforeInvalidURL = nil
+        if !state.isActive {
+            if let previousState {
+                state = previousState
+            } else if items.isEmpty {
+                state = .idle
+            }
+            if items.isEmpty {
+                contentID = nil
+            }
         }
     }
 
@@ -544,6 +567,10 @@ public final class DownloadStore {
         guard !state.isActive else { return }
         let trimmedURL = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let cid = GoFileAPI.contentID(from: trimmedURL) else {
+            if !hasInvalidURL {
+                stateBeforeInvalidURL = items.isEmpty ? .idle : state
+            }
+            needsPasswordPrompt = false
             hasInvalidURL = true
             let msg = trimmedURL.isEmpty
                 ? "Please enter a valid GoFile URL or ID."
@@ -554,6 +581,7 @@ public final class DownloadStore {
         }
 
         hasInvalidURL = false
+        stateBeforeInvalidURL = nil
         if trimmedURL == cid {
             urlInput = GoFileAPI.webURL(forContentID: cid)
         }

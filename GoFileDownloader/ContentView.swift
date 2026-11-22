@@ -417,7 +417,9 @@ struct ContentView: View {
         case .failed(let msg):
             ContentUnavailableView {
                 Label(
-                    store.needsPasswordPrompt ? "Password Required" : "Could Not Load Album",
+                    store.needsPasswordPrompt
+                        ? "Password Required"
+                        : (store.hasInvalidURL ? "Invalid GoFile Link" : "Could Not Load Album"),
                     systemImage: store.needsPasswordPrompt ? "lock.fill" : "exclamationmark.triangle"
                 )
             } description: {
