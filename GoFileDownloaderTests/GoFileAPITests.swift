@@ -4,8 +4,9 @@ import Testing
 
 @Suite("GoFileAPI Tests")
 struct GoFileAPITests {
-    @Test("Content ID extraction accepts valid GoFile URLs and rejects invalid hosts, schemes, or paths")
+    @Test("Content ID extraction accepts valid GoFile URLs and bare content IDs, and rejects invalid inputs")
     func contentIDExtraction() {
+        // Full GoFile URLs
         #expect(GoFileAPI.contentID(from: "https://gofile.io/d/clgeTz") == "clgeTz")
         #expect(GoFileAPI.contentID(from: "https://gofile.io/d/hXHGR1/") == "hXHGR1")
         #expect(GoFileAPI.contentID(from: "  https://gofile.io/d/abc123///  ") == "abc123")
@@ -14,14 +15,39 @@ struct GoFileAPITests {
         #expect(GoFileAPI.contentID(from: "https://gofile.io/d/clgeTz#section") == "clgeTz")
         #expect(GoFileAPI.contentID(from: "http://GOFILE.IO/d/clgeTz?a=1#frag") == "clgeTz")
 
+        // Bare content IDs (last path component of a GoFile URL)
+        #expect(GoFileAPI.contentID(from: "clgeTz") == "clgeTz")
+        #expect(GoFileAPI.contentID(from: "  hXHGR1  ") == "hXHGR1")
+        #expect(GoFileAPI.contentID(from: "abc_123-XYZ") == "abc_123-XYZ")
+        #expect(GoFileAPI.contentID(from: "550e8400-e29b-41d4-a716-446655440000") == "550e8400-e29b-41d4-a716-446655440000")
+
+        // Canonical web URL construction
+        #expect(GoFileAPI.webURL(forContentID: "clgeTz") == "https://gofile.io/d/clgeTz")
+
+        // Rejected partial paths, scheme-less URLs, and malformed inputs
+        #expect(GoFileAPI.contentID(from: "d/clgeTz") == nil)
+        #expect(GoFileAPI.contentID(from: "/d/clgeTz") == nil)
+        #expect(GoFileAPI.contentID(from: "gofile.io/d/clgeTz") == nil)
+        #expect(GoFileAPI.contentID(from: "www.gofile.io/d/clgeTz") == nil)
+        #expect(GoFileAPI.contentID(from: "clgeTz/") == nil)
+        #expect(GoFileAPI.contentID(from: "/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "https://gofile.io/c/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "https://gofile.io/d/clgeTz/extra") == nil)
         #expect(GoFileAPI.contentID(from: "https://gofile.io/d/..") == nil)
+        #expect(GoFileAPI.contentID(from: "https://gofile.io/d/abc%2Fdef") == nil)
+        #expect(GoFileAPI.contentID(from: "https://evil.com@gofile.io/d/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "https://evil.com/d/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "https://notgofile.io/d/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "https://.gofile.io/d/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "ftp://gofile.io/d/clgeTz") == nil)
         #expect(GoFileAPI.contentID(from: "https://example.com") == nil)
+        #expect(GoFileAPI.contentID(from: "example.com") == nil)
+        #expect(GoFileAPI.contentID(from: "..") == nil)
+        #expect(GoFileAPI.contentID(from: "../bad") == nil)
+        #expect(GoFileAPI.contentID(from: "abc?x=1") == nil)
+        #expect(GoFileAPI.contentID(from: "abc#frag") == nil)
+        #expect(GoFileAPI.contentID(from: "hello world") == nil)
+        #expect(GoFileAPI.contentID(from: "   ") == nil)
         #expect(GoFileAPI.contentID(from: "") == nil)
     }
 

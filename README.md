@@ -32,7 +32,7 @@ Built with Swift 6 and SwiftUI — featuring concurrent downloads, resumable chu
 ## Features
 
 ### Downloads & Album Resolution
-- **Recursive Album & Folder Downloads** — Resolves GoFile links (`https://gofile.io/d/<id>`) and nested subfolders while preserving local directory structure, with built-in cycle, depth (`32` levels), and pagination (`100` pages) guards.
+- **Recursive Album & Folder Downloads** — Resolves GoFile links (`https://gofile.io/d/<id>`) or bare content IDs (`<id>`) and nested subfolders while preserving local directory structure, with built-in cycle, depth (`32` levels), and pagination (`100` pages) guards.
 - **Password-Protected Links** — Supports password-protected GoFile albums (SHA-256 hashed client-side) and automatically highlights and focuses the password field when authentication is required or incorrect.
 - **Concurrent Worker Pool & Smart Retries** — Downloads files in parallel with configurable concurrency (`1–8` workers) and per-file retries (`0–10`), using jittered exponential backoff with extended cooldowns for HTTP `421`, `429`, and `503` responses.
 - **Automatic Deduplication & Skip Existing** — Resolves APFS case-insensitive filename collisions per folder by appending ` (1)`, ` (2)`, etc. before the extension, and automatically skips existing files whose size matches the expected remote size.
@@ -107,7 +107,7 @@ open build/Build/Products/Release/GoFileDownloader.app
 
 ### Quick Start
 
-1. Paste a GoFile album URL (`https://gofile.io/d/<id>`) into the URL field, or click the clipboard icon to paste.
+1. Paste a GoFile album URL (`https://gofile.io/d/<id>`) or bare content ID (`<id>`) into the URL field, or click the clipboard icon to paste. Bare IDs automatically expand to `https://gofile.io/d/<id>` when the download starts.
 2. If the album is password-protected, enter the password in the optional password field.
 3. Confirm or change the destination folder (defaults to `~/Downloads/GoFile`).
 4. Click **Download** (or press `Return`).
@@ -140,7 +140,7 @@ You can launch the app pre-configured from Terminal or scripts:
 
 | Flag | Description |
 | --- | --- |
-| `--url <url>` | Pre-fill the GoFile album URL |
+| `--url <url or id>` | Pre-fill the GoFile album URL or bare content ID |
 | `--password <password>` | Pre-fill the album password |
 | `--output <path>` | Override the destination download folder |
 | `--autostart` | Automatically start downloading after launch |
